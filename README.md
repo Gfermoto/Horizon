@@ -1,3 +1,22 @@
+> **About this fork (`Gfermoto/Horizon`)**  
+> Production-oriented fork of [Thysrael/Horizon](https://github.com/Thysrael/Horizon) (MIT).  
+> Upstream remains the home of the project — please prefer contributing general fixes there when they apply cleanly.
+>
+> **Why this fork exists:** daily digests that re-publish the *same story* from another outlet feel like spam. URL-only dedup is not enough.
+>
+> **What we add on top of upstream**
+> - **Cross-day published memory** — skip items already covered in recent digests (URL + near-duplicate titles)
+> - **AI topic dedup against already-published headlines** — catch paraphrased reprints (`life.ru` vs regional mirror, etc.)
+> - **Harder RSS / extraction path** — more resilient fetch/extract for messy feeds
+> - Small token / enricher / trafilatura fixes used in long-running channels
+>
+> **Used by:** [Dawnwire](https://github.com/Gfermoto/Dawnwire) (private product: Telegram publisher + control plane). This engine repo stays open so others can reuse the anti-spam digests work without opening the product.
+>
+> **Track upstream:** `git remote add upstream https://github.com/Thysrael/Horizon.git && git fetch upstream`  
+> Key entry points: `src/processing/published_memory.py`, `src/orchestrator.py` (`drop_already_published`, history filter).
+
+---
+
 <div align="center">
 <h1>🌅 Horizon</h1>
 
