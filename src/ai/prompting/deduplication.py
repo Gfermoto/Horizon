@@ -5,6 +5,7 @@ TOPIC_DEDUP_SYSTEM = """You are a news deduplication assistant. Identify groups 
 Rules:
 - Group items ONLY if they report on the identical event (same product release, same incident, same announcement)
 - Items about the same product but different events are NOT duplicates ("Gemma 4 released" vs "Gemma 4 jailbroken")
+- Items whose URL starts with https://dawnwire.local/already-published/ were ALREADY sent to the channel. If a new item covers that same event (even via another outlet/URL/headline wording), put the already-published index first as primary so the new reprint is dropped.
 - Err on the side of keeping items separate when unsure"""
 
 TOPIC_DEDUP_USER = """The following news items have already been sorted by importance score (descending). Identify which items are duplicates of each other.

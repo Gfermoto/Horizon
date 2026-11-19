@@ -35,9 +35,12 @@ class TrafilaturaExtractor(BaseExtractor):
             return None
 
         try:
-            response = await safe_request(client, "GET", url, headers=ARTICLE_HEADERS)
+            response = await asyncio.wait_for(
+                safe_request(client, "GET", url, headers=ARTICLE_HEADERS),
+                timeout=12.0,
+            )
             response.raise_for_status()
-        except (httpx.HTTPError, UnsafeURLError) as e:
+        except (httpx.HTTPError, UnsafeURLError, asyncio.TimeoutError) as e:
             logger.warning("Failed to fetch article %s: %s", url, e)
             return None
 

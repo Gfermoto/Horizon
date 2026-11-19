@@ -1,6 +1,7 @@
 """Main orchestrator coordinating the entire workflow."""
 
 import asyncio
+import os
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -34,7 +35,7 @@ from .ai.errors import AIProviderUnavailableError
 from .ai.analyzer import ContentAnalyzer
 from .ai.summarizer import DailySummarizer
 from .ai.enricher import ContentEnricher, EnrichmentBatchResult
-from .ai.tokens import get_usage_snapshot
+from .ai.tokens import get_usage_snapshot, write_usage_snapshot
 from .processing import ProfileRegistry
 from .processing.content import COMMENTS_MARKER, split_content
 from .processing.tools import ToolRegistry
@@ -276,6 +277,41 @@ class HorizonOrchestrator:
             if self.last_fetch_report and self.last_fetch_report.all_failed:
                 raise RuntimeError(self.last_fetch_report.failure_message())
 
+            if self.config.collection.exclude_urls:
+                excluded_keys = {
+                    _deduplication_url_key(u)
+                    for u in self.config.collection.exclude_urls
+                    if u
+                }
+                before_exclude = len(all_items)
+                all_items = [
+                    item
+                    for item in all_items
+                    if _deduplication_url_key(str(item.url)) not in excluded_keys
+                ]
+                if len(all_items) < before_exclude:
+                    self.console.print(
+                        f"   Skipped {before_exclude - len(all_items)} already-published items\n"
+                    )
+
+            # Cross-day memory: same story under a new outlet URL must not re-enter.
+            from .processing.published_memory import filter_new_items
+
+            exclude_fps = list(
+                getattr(self.config.collection, "exclude_title_fingerprints", None) or []
+            )
+            before_memory = len(all_items)
+            all_items, memory_hits = filter_new_items(
+                all_items,
+                self.storage.summaries_dir,
+                exclude_urls=self.config.collection.exclude_urls or [],
+                exclude_fingerprints=exclude_fps,
+            )
+            if memory_hits:
+                self.console.print(
+                    f"   Skipped {before_memory - len(all_items)} items already in digest history\n"
+                )
+
             if not all_items:
                 self.console.print("[yellow]No new content found. Exiting.[/yellow]")
                 return
@@ -313,9 +349,13 @@ class HorizonOrchestrator:
             # 6. Search related stories + enrich with background knowledge (2nd AI pass)
             enrichment_result = await self.enrich_items(important_items)
             if enrichment_result.status == "failure":
+                details = "; ".join(
+                    f"{item_id}: {reason}"
+                    for item_id, reason in enrichment_result.failures.items()
+                )
                 raise RuntimeError(
                     f"Enrichment failed for all {len(important_items)} selected items: "
-                    + ", ".join(enrichment_result.failed_ids)
+                    + details
                 )
 
             # 7. Generate and save daily summaries for each configured language
@@ -417,6 +457,15 @@ class HorizonOrchestrator:
                     self.console.print(
                         f"   {self.icons['detail']} {provider}: {u.total} tokens "
                         f"(in: {u.input_tokens}, out: {u.output_tokens})"
+                    )
+
+            usage_path = os.environ.get("HORIZON_USAGE_JSON")
+            if usage_path:
+                try:
+                    write_usage_snapshot(usage_path, usage)
+                except OSError as exc:
+                    self.console.print(
+                        f"[yellow]Could not write usage JSON: {exc}[/yellow]"
                     )
 
         except Exception as e:
@@ -775,6 +824,67 @@ class HorizonOrchestrator:
 
         return [item for i, item in enumerate(items) if i not in drop_indices]
 
+    async def drop_already_published(
+        self,
+        items: List[ContentItem],
+        *,
+        log: bool = True,
+        days: int = 30,
+    ) -> List[ContentItem]:
+        """Drop new items that AI judges to be reprints of prior digest stories."""
+        if not items:
+            return items
+        from .models import (
+            ClassificationResult,
+            ContentAnalysis,
+            ProcessingResult,
+            SourceType,
+        )
+        from .processing.published_memory import history_titles
+
+        prior_titles = history_titles(self.storage.summaries_dir, days=days)
+        extra_fps = list(
+            getattr(self.config.collection, "exclude_title_fingerprints", None) or []
+        )
+        # Fingerprints may be raw titles or already-normalized; keep as phantom titles.
+        prior_titles = list(dict.fromkeys([*prior_titles, *[fp for fp in extra_fps if fp]]))
+        if not prior_titles:
+            return items
+
+        phantoms: List[ContentItem] = []
+        for index, title in enumerate(prior_titles[:80]):
+            phantoms.append(
+                ContentItem(
+                    id=f"history:published:{index}",
+                    source_type=SourceType.RSS,
+                    title=title,
+                    url=f"https://dawnwire.local/already-published/{index}",
+                    published_at=datetime.now(timezone.utc),
+                    metadata={"already_published": True},
+                    processing=ProcessingResult(
+                        classification=ClassificationResult(
+                            profile=self.profiles.default_profile,
+                            method="source_override",
+                        ),
+                        analysis=ContentAnalysis(
+                            score=10.0,
+                            reason="already published",
+                            summary=title,
+                        ),
+                    ),
+                )
+            )
+
+        combined = phantoms + items
+        merged = await self.merge_topic_duplicates(combined, log=log)
+        kept = [
+            item
+            for item in merged
+            if not (item.metadata or {}).get("already_published")
+            and not str(item.url).startswith("https://dawnwire.local/already-published/")
+        ]
+        return kept
+
     async def filter_items(
         self,
         items: List[ContentItem],
@@ -840,6 +950,16 @@ class HorizonOrchestrator:
                 f"{self.icons['cleanup']} Removed {topic_dedup_removed} topic duplicates "
                 f"→ {len(deduped_items)} unique items\n"
             )
+
+        if topic_dedup and deduped_items:
+            before_history = len(deduped_items)
+            deduped_items = await self.drop_already_published(deduped_items, log=log)
+            history_removed = before_history - len(deduped_items)
+            if log and history_removed:
+                self.console.print(
+                    f"{self.icons['cleanup']} Dropped {history_removed} reprints of "
+                    f"already-published stories → {len(deduped_items)} unique items\n"
+                )
 
         balanced_digest = (
             self.apply_balanced_digest(deduped_items, log=log)

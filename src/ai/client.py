@@ -47,6 +47,7 @@ _DEFAULT_API_KEY_ENVS = {
     AIProvider.DOUBAO: "DOUBAO_API_KEY",
     AIProvider.MINIMAX: "MINIMAX_API_KEY",
     AIProvider.DEEPSEEK: "DEEPSEEK_API_KEY",
+    AIProvider.GIGACHAT: "GIGACHAT_API_KEY",
 }
 
 
@@ -247,7 +248,7 @@ class OpenAIClient(AIClient):
     }
 
     # Providers that don't support response_format
-    _NO_RESPONSE_FORMAT = {"minimax"}
+    _NO_RESPONSE_FORMAT = {"minimax", "gigachat"}
 
     # Providers that need temperature clamped to (0, 1]
     _TEMP_CLAMP = {"minimax"}
@@ -271,6 +272,8 @@ class OpenAIClient(AIClient):
         base_url = self._resolve_base_url(config)
         if base_url:
             kwargs["base_url"] = base_url
+        if config.provider == AIProvider.GIGACHAT:
+            kwargs["http_client"] = httpx.AsyncClient(verify=False)
 
         self.client = AsyncOpenAI(**kwargs)
         self.model = config.model
@@ -609,6 +612,7 @@ def _create_single_client(config: AIConfig) -> AIClient:
         AIProvider.DOUBAO,
         AIProvider.MINIMAX,
         AIProvider.DEEPSEEK,
+        AIProvider.GIGACHAT,
         AIProvider.OLLAMA,
     }:
         return OpenAIClient(config)

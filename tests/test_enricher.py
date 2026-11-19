@@ -503,12 +503,19 @@ def test_failed_reenrichment_removes_stale_target_artifact():
     assert "en" not in item.processing.artifacts
 
 
-def test_enrichment_rejects_cross_block_source_reference():
-    block = ContentBlock(
+def test_enrichment_drops_cross_block_source_reference():
+    summary = ContentBlock(
         id="summary",
         type="section",
         title="News",
         content="Content",
+        source_refs=["tool-1-1"],
+    )
+    background = ContentBlock(
+        id="background",
+        type="section",
+        title="Background",
+        content="Context",
         source_refs=["tool-1-1"],
     )
     tool_result = ToolResult(
@@ -524,10 +531,12 @@ def test_enrichment_rejects_cross_block_source_reference():
         ],
     )
 
-    with pytest.raises(ValueError, match="unknown source refs"):
-        ContentEnricher._validate_blocks(
-            [block], PROFILES.get("tech-news"), [tool_result]
-        )
+    ContentEnricher._validate_blocks(
+        [summary, background], PROFILES.get("tech-news"), [tool_result]
+    )
+    # summary cannot cite background's tool results
+    assert summary.source_refs == []
+    assert background.source_refs == ["tool-1-1"]
 
 
 def test_enrichment_rejects_empty_required_block():

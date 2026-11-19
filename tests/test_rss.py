@@ -67,6 +67,17 @@ def test_timezone_less_pubdate_is_treated_as_utc() -> None:
     )
 
 
+def test_max_entries_caps_accepted_items() -> None:
+    client = _make_feed_client(_THREE_ENTRIES)
+    source = RSSSourceConfig(
+        name="Test", url="https://example.com/feed.xml", max_entries=2
+    )
+
+    items = asyncio.run(RSSScraper([source], client).fetch(_SINCE)).items
+
+    assert [item.title for item in items] == ["Item 1", "Item 2"]
+
+
 def _make_registry(name: str, extractor):
     registry = MagicMock()
     registry.get.side_effect = lambda n: extractor if n == name else None
@@ -459,3 +470,54 @@ def test_extractor_still_overrides_longest_feed_content(extracted) -> None:
     assert result.status == "success"
     assert result.items[0].content == (extracted if extracted is not None else _FULL_CONTENT)
     extractor.extract.assert_awaited_once_with("https://example.com/item-1", client)
+
+
+def test_bing_redirect_unwrapped_and_must_match_filters_mentions() -> None:
+    from src.scrapers.rss import _matches_topic_query, _unwrap_entry_url
+
+    wrapped = (
+        "http://www.bing.com/news/apiclick.aspx?ref=FexRss&tid=abc123"
+        "&url=https%3a%2f%2fpoisknews.ru%2fhimiya%2fnew-mof"
+    )
+    assert _unwrap_entry_url(wrapped) == "https://poisknews.ru/himiya/new-mof"
+
+    # Org prefix optional when distinctive acronym matches; short acronym never matches inside words.
+    assert _matches_topic_query("Студенты МИРЭА создали нанотрубки", "РТУ МИРЭА")
+    assert _matches_topic_query("Исследователи РТУ МИРЭА открыли метод", "РТУ МИРЭА")
+    assert not _matches_topic_query("Java4Shell уязвимость в OpenJDK", "РТУ МИРЭА")
+    assert _matches_topic_query("Разработка квантовых компьютеров в Сколтехе", "квантовые компьютеры")
+    assert not _matches_topic_query("Новости России за сегодня", "ИИ")
+    assert _matches_topic_query("Новые ИИ-агенты в медицине", "ИИ")
+
+    bing_feed = f"""<?xml version="1.0" encoding="utf-8"?>
+    <rss version="2.0"><channel><title>Bing</title>
+      <item>
+        <title>Редкоземельный прорыв учёных</title>
+        <link>{wrapped}</link>
+        <pubDate>Fri, 24 Apr 2026 12:00:00 GMT</pubDate>
+        <description>Краткий анонс без названия вуза.</description>
+      </item>
+      <item>
+        <title>Посторонняя новость</title>
+        <link>http://www.bing.com/news/apiclick.aspx?tid=def456&amp;url=https%3a%2f%2fexample.com%2fother</link>
+        <pubDate>Fri, 24 Apr 2026 12:00:00 GMT</pubDate>
+        <description>Совсем про другое.</description>
+      </item>
+    </channel></rss>"""
+    client = _make_feed_client(bing_feed)
+    extractor = AsyncMock()
+    extractor.extract.side_effect = [
+        "Полный текст: исследователи РТУ МИРЭА синтезировали материал.",
+        "Полный текст без искомого упоминания.",
+    ]
+    source = RSSSourceConfig(
+        name="Уточнение",
+        url="https://www.bing.com/news/search?q=test&format=rss",
+        content_extractor="my-ext",
+        must_match="РТУ МИРЭА",
+    )
+    scraper = RSSScraper([source], client, extractors=_make_registry("my-ext", extractor))
+    items = asyncio.run(scraper.fetch(_SINCE)).items
+    assert len(items) == 1
+    assert str(items[0].url) == "https://poisknews.ru/himiya/new-mof"
+    assert items[0].metadata["feed_name"] == "poisknews.ru"

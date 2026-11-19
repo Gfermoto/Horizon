@@ -492,12 +492,18 @@ class ContentEnricher:
                 if result.block_id == block.id
                 for index, _ in enumerate(result.results, start=1)
             }
-            unknown_refs = set(block.source_refs) - block_source_ids
+            # Models without strict JSON mode (e.g. GigaChat) invent free-text
+            # citations. Keep only refs that map to real tool results.
+            unknown_refs = [ref for ref in block.source_refs if ref not in block_source_ids]
             if unknown_refs:
-                raise ValueError(
-                    f"Block {block.id} contains unknown source refs: "
-                    f"{', '.join(sorted(unknown_refs))}"
+                logger.warning(
+                    "Dropping unknown source refs in block %s: %s",
+                    block.id,
+                    ", ".join(unknown_refs),
                 )
+                block.source_refs = [
+                    ref for ref in block.source_refs if ref in block_source_ids
+                ]
         required = {block.id for block in configured.values() if not block.optional}
         missing = required - seen
         if missing:

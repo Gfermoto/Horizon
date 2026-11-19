@@ -130,6 +130,7 @@ class AIProvider(str, Enum):
     DOUBAO = "doubao"
     MINIMAX = "minimax"
     DEEPSEEK = "deepseek"
+    GIGACHAT = "gigachat"
     OLLAMA = "ollama"
 
 
@@ -181,6 +182,11 @@ AI_PROVIDER_DEFAULTS = {
         "model": "deepseek-chat",
         "api_key_env": "DEEPSEEK_API_KEY",
         "base_url": "https://api.deepseek.com",
+    },
+    AIProvider.GIGACHAT: {
+        "model": "GigaChat-3-Ultra",
+        "api_key_env": "GIGACHAT_API_KEY",
+        "base_url": "https://api.giga.chat/v1",
     },
     AIProvider.OLLAMA: {
         "model": "llama3.1",
@@ -320,6 +326,8 @@ class RSSSourceConfig(BaseModel):
     category: Optional[str] = None
     content_extractor: Optional[str] = None
     profile: ProfileRoute = None
+    max_entries: Optional[int] = Field(default=None, ge=1)
+    must_match: Optional[str] = None
 
 
 class RedditSubredditConfig(BaseModel):
@@ -605,6 +613,9 @@ class CollectionConfig(BaseModel):
     # Positivity is collection_hours(), applied once before a run. This field
     # stores the configured number and does not check it again.
     time_window_hours: int = 24
+    exclude_urls: List[str] = Field(default_factory=list)
+    # Normalized headlines already delivered (cross-URL reprints of the same story).
+    exclude_title_fingerprints: List[str] = Field(default_factory=list)
 
     @field_validator("time_window_hours", mode="before")
     @classmethod

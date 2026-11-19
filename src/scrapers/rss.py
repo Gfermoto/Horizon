@@ -10,6 +10,7 @@ import re
 from datetime import datetime, timezone
 from typing import List, Optional
 from email.utils import parsedate_to_datetime
+from urllib.parse import parse_qs, urlsplit
 import httpx
 import feedparser
 
@@ -19,9 +20,137 @@ from ..models import ContentItem, SourceType, RSSSourceConfig
 
 logger = logging.getLogger(__name__)
 
-# Identify feed requests: some publishers reject httpx's default User-Agent.
-RSS_USER_AGENT = "Horizon/0.1.0 (+https://github.com/Thysrael/Horizon)"
-MAX_CONCURRENT_FEEDS = 3
+# Identify feed requests with a browser-compatible UA while keeping Horizon token
+# (publishers such as Nature return empty pages to bare bot/httpx User-Agents).
+RSS_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36 "
+    "Horizon/0.1.0 (+https://github.com/Thysrael/Horizon)"
+)
+RSS_ACCEPT = (
+    "application/rss+xml, application/atom+xml, application/rdf+xml, "
+    "application/xml, text/xml;q=0.9, */*;q=0.8"
+)
+MAX_CONCURRENT_FEEDS = 4
+EXTRACT_CONCURRENCY = 6
+EXTRACT_TIMEOUT_SEC = 10.0
+
+_STOPWORDS = frozenset({
+    "в", "во", "на", "по", "из", "за", "для", "от", "до", "про", "об", "о",
+    "к", "ко", "с", "со", "у", "и", "или", "не", "ни", "а", "но",
+    "and", "the", "for", "of", "in", "on", "to", "with", "at", "by",
+})
+_ORG_PREFIXES = frozenset({
+    "рту", "ниу", "мгту", "фгбоу", "фгаоу", "пао", "ооо", "зао", "оао", "ао",
+    "гк", "нпо", "ано", "гуп", "фгуп", "мбоу", "гаоу",
+})
+_RU_ENDINGS = (
+    "ами", "ями", "ого", "его", "ому", "ему", "ыми", "ими", "ах", "ях",
+    "ов", "ев", "ей", "ам", "ям", "ом", "ем", "ой", "ую", "юю",
+    "ая", "яя", "ое", "ее", "ые", "ие", "ый", "ий",
+    "а", "я", "у", "ю", "е", "и", "ы", "о", "ь", "s",
+)
+
+
+def _unwrap_entry_url(raw_url: str) -> str:
+    """Unwrap search-engine redirect wrappers (e.g. Bing News apiclick.aspx?url=...)."""
+    url = (raw_url or "").strip()
+    if not url:
+        return url
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+    host = (parts.hostname or "").lower()
+    if host.endswith("bing.com") and "apiclick" in parts.path.lower():
+        target = (parse_qs(parts.query).get("url") or [""])[0].strip()
+        if target.startswith(("http://", "https://")):
+            return target
+    return url
+
+
+def _is_search_feed_url(feed_url: str) -> bool:
+    lower = feed_url.lower()
+    return "bing.com/news/search" in lower or "news.google.com/rss/search" in lower
+
+
+def _publisher_label(entry: dict, resolved_url: str, fallback: str) -> str:
+    """Prefer the real publisher name/domain over a synthetic search-feed title."""
+    for key in ("news_source", "source"):
+        val = entry.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+        if isinstance(val, dict) and isinstance(val.get("title"), str) and val["title"].strip():
+            return val["title"].strip()
+    try:
+        host = (urlsplit(resolved_url).hostname or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        if host and not host.endswith(("bing.com", "google.com")):
+            return host
+    except ValueError:
+        pass
+    return fallback
+
+
+def _stem_token(raw_token: str) -> tuple[str, bool]:
+    """Return (normalized_pattern_stem, exact_word_end) for a query token."""
+    is_acronym = len(raw_token) >= 2 and raw_token.isupper()
+    norm = raw_token.lower().replace("ё", "е")
+    if len(norm) <= 3 or (is_acronym and len(norm) <= 4):
+        return norm, True
+    if is_acronym:
+        return norm, False
+    for ending in _RU_ENDINGS:
+        if norm.endswith(ending) and len(norm) - len(ending) >= 4:
+            return norm[: -len(ending)], False
+    return norm, False
+
+
+def _matches_topic_query(text: str, query: str) -> bool:
+    """Verify that ``text`` genuinely mentions the entity/topic in ``query``."""
+    cleaned_q = (query or "").strip()
+    if not cleaned_q:
+        return True
+    haystack = (text or "").lower().replace("ё", "е")
+    if not haystack:
+        return False
+
+    clauses = re.split(r"\s+(?:OR|ИЛИ)\s+|\|", cleaned_q)
+    matched_any_clause = False
+    has_valid_clause = False
+
+    for clause in clauses:
+        raw_tokens = [
+            tok for tok in re.findall(r"[A-Za-zА-Яа-яЁё0-9]+(?:-[A-Za-zА-Яа-яЁё0-9]+)*", clause)
+            if len(tok) >= 2 and tok.lower().replace("ё", "е") not in _STOPWORDS
+        ]
+        if not raw_tokens:
+            continue
+        has_valid_clause = True
+        non_prefix = [
+            tok for tok in raw_tokens
+            if tok.lower().replace("ё", "е") not in _ORG_PREFIXES
+        ]
+        required = non_prefix if non_prefix else raw_tokens
+
+        clause_ok = True
+        for tok in required:
+            stem, exact_end = _stem_token(tok)
+            escaped = re.escape(stem)
+            pattern = (
+                rf"(?<![A-Za-zА-Яа-яЁё0-9]){escaped}(?![A-Za-zА-Яа-яЁё0-9])"
+                if exact_end
+                else rf"(?<![A-Za-zА-Яа-яЁё0-9]){escaped}"
+            )
+            if not re.search(pattern, haystack):
+                clause_ok = False
+                break
+        if clause_ok:
+            matched_any_clause = True
+            break
+
+    return matched_any_clause if has_valid_clause else True
 
 # Rate-limited feeds (e.g. Reddit RSS answers bursts with 429) are retried with
 # linear backoff, honouring numeric or HTTP-date Retry-After values up to the cap.
@@ -124,11 +253,12 @@ class RSSScraper(BaseScraper):
             lambda m: os.environ.get(m.group(1), m.group(0)).strip(),
             str(source.url),
         )
+        is_search_feed = _is_search_feed_url(feed_url)
         for attempt in range(RATE_LIMIT_RETRIES + 1):
             response = await self.client.get(
                 feed_url,
                 follow_redirects=True,
-                headers={"User-Agent": RSS_USER_AGENT},
+                headers={"User-Agent": RSS_USER_AGENT, "Accept": RSS_ACCEPT},
             )
             if response.status_code != 429 or attempt == RATE_LIMIT_RETRIES:
                 break
@@ -146,40 +276,72 @@ class RSSScraper(BaseScraper):
             raise ValueError("Invalid RSS/Atom feed")
 
         for ordinal, entry in enumerate(feed.entries, start=1):
+            if source.max_entries is not None and len(result.items) >= source.max_entries:
+                break
             try:
                 published_at = self._parse_date(entry)
                 if not published_at or published_at < since:
                     continue
 
+                raw_link = entry.get("link", str(source.url))
+                resolved_url = _unwrap_entry_url(raw_link) or str(source.url)
+                title = entry.get("title", "Untitled")
+                rss_content = self._extract_content(entry)
+
+                # For regular feeds with must_match, skip unrelated items before
+                # making external article-extraction HTTP calls.
+                if (
+                    source.must_match
+                    and not is_search_feed
+                    and not _matches_topic_query(f"{title}\n{rss_content}", source.must_match)
+                ):
+                    continue
+
                 feed_id = str(source.url).split("//")[1].replace("/", "_")
-                entry_id = entry.get("id", entry.get("link", ""))
+                entry_id = (
+                    resolved_url
+                    if resolved_url != raw_link
+                    else entry.get("id", resolved_url)
+                )
                 entry_hash = hashlib.sha256(str(entry_id).encode("utf-8")).hexdigest()[:16]
-                content = self._extract_content(entry)
+                content = rss_content
 
                 if source.content_extractor and self._extractors:
                     extractor = self._extractors.get(source.content_extractor)
-                    if extractor:
-                        url = entry.get("link", "")
-                        if url:
-                            full = await extractor.extract(url, self.client)
-                            if full:
-                                content = full
+                    if extractor and resolved_url and (
+                        is_search_feed or source.must_match or len(rss_content) < 500
+                    ):
+                        full = await extractor.extract(resolved_url, self.client)
+                        if full:
+                            content = full
 
+                if source.must_match and not _matches_topic_query(
+                    f"{title}\n{rss_content}\n{content}", source.must_match
+                ):
+                    continue
+
+                feed_label = (
+                    _publisher_label(entry, resolved_url, source.name)
+                    if is_search_feed
+                    else source.name
+                )
                 result.items.append(ContentItem(
                     id=self._generate_id("rss", feed_id, entry_hash),
                     source_type=SourceType.RSS,
-                    title=entry.get("title", "Untitled"),
-                    url=entry.get("link", str(source.url)),
+                    title=title,
+                    url=resolved_url,
                     content=content,
-                    author=entry.get("author", source.name),
+                    author=entry.get("author", feed_label),
                     published_at=published_at,
                     profile=source.profile,
                     metadata={
-                        "feed_name": source.name,
+                        "feed_name": feed_label,
                         "category": source.category,
                         "tags": [tag.term for tag in entry.get("tags", [])],
                     },
                 ))
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
                 label = f"{source.name}/entry:{ordinal}"
                 # Avoid multiline validation details that include entry values.

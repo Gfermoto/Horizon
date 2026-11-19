@@ -6,7 +6,9 @@ Horizon run, so the orchestrator can print a summary at the end.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Dict
 
 
@@ -64,3 +66,29 @@ def get_usage_snapshot() -> TokenUsageSnapshot:
 def reset_usage() -> None:
     """Reset all accumulated usage (useful for tests)."""
     _provider_usage.clear()
+
+
+def write_usage_snapshot(path: str | Path, snapshot: TokenUsageSnapshot) -> None:
+    """Write a usage snapshot as JSON for billing and per-run accounting."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        json.dumps(
+            {
+                "total_input_tokens": snapshot.total_input_tokens,
+                "total_output_tokens": snapshot.total_output_tokens,
+                "total_tokens": snapshot.total_tokens,
+                "per_provider": {
+                    provider: {
+                        "input_tokens": usage.input_tokens,
+                        "output_tokens": usage.output_tokens,
+                        "total_tokens": usage.total,
+                    }
+                    for provider, usage in snapshot.per_provider.items()
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
