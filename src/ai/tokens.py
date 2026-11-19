@@ -68,6 +68,102 @@ def reset_usage() -> None:
     _provider_usage.clear()
 
 
+class BudgetExceeded(RuntimeError):
+    """Raised when a run would spend more than the configured budget."""
+
+
+@dataclass
+class BudgetGuard:
+    """Hard ceiling on tokens/cost for one run, with soft degradation.
+
+    The point is not to abort mid-run — a half-written digest is worse than a
+    shorter one. When the ceiling approaches, cheap optional stages (extra
+    enrichment) are skipped and the digest is marked ``budget_truncated``.
+    """
+
+    max_total_tokens: int | None = None
+    max_cost_usd: float | None = None
+    # Approximate blended price per 1M tokens; override per deployment.
+    usd_per_million_tokens: float = 1.0
+    _spent_tokens: int = 0
+    _truncated: bool = False
+    _reason: str = ""
+
+    def reset(self) -> None:
+        self._spent_tokens = 0
+        self._truncated = False
+        self._reason = ""
+
+    def sync_from_usage(self) -> int:
+        """Copy the process-wide counter into this guard; returns tokens spent."""
+        self._spent_tokens = get_usage_snapshot().total_tokens
+        return self._spent_tokens
+
+    @property
+    def tokens_spent(self) -> int:
+        return self._spent_tokens
+
+    @property
+    def cost_usd(self) -> float:
+        return self._spent_tokens / 1_000_000 * self.usd_per_million_tokens
+
+    @property
+    def truncated(self) -> bool:
+        return self._truncated
+
+    @property
+    def reason(self) -> str:
+        return self._reason
+
+    def remaining_tokens(self) -> int | None:
+        if self.max_total_tokens is None:
+            return None
+        return max(0, self.max_total_tokens - self._spent_tokens)
+
+    def exhausted(self) -> bool:
+        """True when no further paid stage should run."""
+        self.sync_from_usage()
+        if self.max_total_tokens is not None and self._spent_tokens >= self.max_total_tokens:
+            self._truncated = True
+            self._reason = (
+                f"token budget reached ({self._spent_tokens}/{self.max_total_tokens})"
+            )
+            return True
+        if self.max_cost_usd is not None and self.cost_usd >= self.max_cost_usd:
+            self._truncated = True
+            self._reason = (
+                f"cost budget reached (${self.cost_usd:.2f}/${self.max_cost_usd:.2f})"
+            )
+            return True
+        return False
+
+    def allow(self, *, stage: str, estimated_tokens: int = 0) -> bool:
+        """Ask before a paid stage. Marks the run truncated when refused."""
+        self.sync_from_usage()
+        projected = self._spent_tokens + max(0, estimated_tokens)
+        if self.max_total_tokens is not None and projected > self.max_total_tokens:
+            self._truncated = True
+            self._reason = f"{stage} would exceed token budget"
+            return False
+        if self.max_cost_usd is not None:
+            projected_cost = projected / 1_000_000 * self.usd_per_million_tokens
+            if projected_cost > self.max_cost_usd:
+                self._truncated = True
+                self._reason = f"{stage} would exceed cost budget"
+                return False
+        return True
+
+    def report(self) -> dict:
+        return {
+            "max_total_tokens": self.max_total_tokens,
+            "max_cost_usd": self.max_cost_usd,
+            "tokens_spent": self._spent_tokens,
+            "cost_usd": round(self.cost_usd, 4),
+            "truncated": self._truncated,
+            "reason": self._reason,
+        }
+
+
 def write_usage_snapshot(path: str | Path, snapshot: TokenUsageSnapshot) -> None:
     """Write a usage snapshot as JSON for billing and per-run accounting."""
     target = Path(path)

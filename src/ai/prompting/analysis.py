@@ -26,8 +26,15 @@ Return valid JSON only:
   "score": <number from 0 to 10>,
   "reason": "<concise explanation>",
   "summary": "<one-sentence summary>",
-  "tags": ["<tag>", "..."]
-}}"""
+  "tags": ["<tag>", "..."],
+  "event_key": "<3-6 lowercase tokens naming the event>"
+}}
+
+`event_key` identifies the underlying real-world event so the same story
+reprinted by another outlet can be recognised later. Use the entity and the
+action (for example "mirea mokp synthesis", "ozon q3 revenue", "tender 123456
+капремонт"), never the outlet name, never a generic word alone. Reuse the exact
+same key when the material is a repeat or a follow-up of the same event."""
 
 
 def analysis_user_prompt(

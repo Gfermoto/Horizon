@@ -1,0 +1,44 @@
+{
+  "id": "ru-digest",
+  "name": "Russian Digest",
+  "display_names": {
+    "ru": "Русский дайджест",
+    "zh": "俄语摘要"
+  },
+  "match": "match.md",
+  "analysis": "analysis.md",
+  "content": {
+    "analysis_max_chars": 2500,
+    "enrichment_max_chars": 9000,
+    "sampling": "head-middle-tail"
+  },
+  "enrichment": {
+    "prompt": "enrichment.md",
+    "blocks": [
+      {
+        "id": "summary",
+        "type": "section",
+        "tools": [],
+        "primary": true
+      },
+      {
+        "id": "why_it_matters",
+        "type": "section",
+        "tools": [],
+        "optional": true
+      },
+      {
+        "id": "details",
+        "type": "section",
+        "tools": [],
+        "optional": true
+      },
+      {
+        "id": "community_discussion",
+        "type": "section",
+        "tools": [],
+        "optional": true
+      }
+    ]
+  }
+}

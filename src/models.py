@@ -62,6 +62,9 @@ class ContentAnalysis(BaseModel):
     reason: str
     summary: str
     tags: List[str] = Field(default_factory=list)
+    # Short normalized identity of the underlying event (3-6 tokens). The AI
+    # emits it in the same analysis pass so cross-day dedup costs no extra call.
+    event_key: Optional[str] = None
 
 
 class ArtifactSource(BaseModel):
@@ -113,9 +116,17 @@ class ContentItem(BaseModel):
     author: Optional[str] = None
     published_at: datetime
     fetched_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: Optional[datetime] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
     profile: ProfileRoute = None
     processing: Optional[ProcessingResult] = None
+    # Stable identity of the material at the source (tender notice number, lot
+    # GUID, article slug). Falls back to the normalized URL when absent, so a
+    # plugin connector can dedup on the platform id instead of the page URL.
+    canonical_key: Optional[str] = None
+    # What the item represents. Keeps one pipeline usable for news, tenders,
+    # releases and regulatory notices without per-vertical code.
+    entity_kind: str = "article"
 
 
 class AIProvider(str, Enum):
@@ -212,6 +223,11 @@ class AIConfig(BaseModel):
     analysis_concurrency: int = 1
     enrichment_concurrency: int = 1
     languages: List[str] = Field(default_factory=lambda: ["en"])
+    # Per-run spend ceiling. None means unlimited (the historical behaviour).
+    max_total_tokens: Optional[int] = Field(default=None, ge=1)
+    max_cost_usd: Optional[float] = Field(default=None, gt=0)
+    # Blended $/1M tokens used to translate the token ceiling into money.
+    usd_per_million_tokens: float = Field(default=1.0, ge=0)
     # Azure OpenAI specific; required when provider == AZURE
     azure_endpoint_env: Optional[str] = None
     api_version: Optional[str] = None
@@ -507,6 +523,24 @@ class GoogleNewsConfig(BaseModel):
     profile: ProfileRoute = None
 
 
+class CustomSourceConfig(BaseModel):
+    """A declarative or plugin-provided source, configured without new code.
+
+    ``type`` names either a built-in plugin (``json_feed``) or an entry point
+    registered under ``horizon.scrapers``. ``config`` is passed through to the
+    plugin untouched, so a vertical connector owns its own schema.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: str
+    name: Optional[str] = None
+    enabled: bool = True
+    category: Optional[str] = None
+    profile: ProfileRoute = None
+    config: Dict[str, Any] = Field(default_factory=dict)
+
+
 class SourcesConfig(BaseModel):
     """All sources configuration."""
 
@@ -520,6 +554,8 @@ class SourcesConfig(BaseModel):
     ossinsight: OSSInsightConfig = Field(default_factory=OSSInsightConfig)
     gdelt: Optional[GDELTConfig] = None
     google_news: Optional[GoogleNewsConfig] = None
+    # Declarative / plugin sources: json_feed or any installed entry point.
+    custom: List[CustomSourceConfig] = Field(default_factory=list)
 
 
 class WebhookConfig(BaseModel):
@@ -616,6 +652,28 @@ class CollectionConfig(BaseModel):
     exclude_urls: List[str] = Field(default_factory=list)
     # Normalized headlines already delivered (cross-URL reprints of the same story).
     exclude_title_fingerprints: List[str] = Field(default_factory=list)
+    # How far back the durable event memory looks when blocking reprints.
+    memory_days: int = Field(default=30, ge=1, le=3650)
+    # Set false to ignore state.db entirely (Markdown history is still used).
+    state_enabled: bool = True
+    # Circuit breaker: after N consecutive failures a source is parked.
+    max_consecutive_failures: int = Field(default=0, ge=0)
+    # Base cooldown for the breaker; escalates 6h -> 24h -> 72h when > 0.
+    cooldown_base_hours: float = Field(default=6.0, ge=0)
+    # When every source fails, still finish the run instead of raising.
+    tolerate_total_failure: bool = False
+
+    # --- zero-LLM pre-filter -------------------------------------------------
+    # Drop items whose text contains none of these substrings (case-insensitive).
+    must_match: List[str] = Field(default_factory=list)
+    # Drop items whose title/text matches any of these regular expressions.
+    exclude_patterns: List[str] = Field(default_factory=list)
+    # Drop items with less usable text than this (0 disables the check).
+    min_content_chars: int = Field(default=0, ge=0)
+    # Cap how many items reach the paid analysis stage (0 = unlimited).
+    max_items_to_analyze: int = Field(default=0, ge=0)
+    # Skip re-analysing identical content seen within this window (0 disables).
+    analysis_cache_ttl_hours: float = Field(default=72.0, ge=0)
 
     @field_validator("time_window_hours", mode="before")
     @classmethod
@@ -638,6 +696,10 @@ class DigestConfig(BaseModel):
     default_group: str = "other"
     default_group_limit: Optional[int] = Field(default=None, gt=0)
     profile_order: List[str] = Field(default_factory=list)
+    # Emit a versioned machine-readable digest next to the Markdown one.
+    export_json: bool = True
+    # Write run_report.json (counters, source health, usage) for observability.
+    write_run_report: bool = True
 
     @field_validator("profile_order")
     @classmethod

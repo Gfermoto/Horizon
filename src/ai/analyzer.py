@@ -31,6 +31,8 @@ class ContentAnalyzer:
         *,
         concurrency: int = 1,
         throttle_sec: float = 0.0,
+        cache: object | None = None,
+        cache_ttl_hours: float = 72.0,
     ):
         self.client = ai_client
         self.profiles = profiles
@@ -38,6 +40,24 @@ class ContentAnalyzer:
         self.console = console or Console(stderr=True)
         self.concurrency = max(concurrency, 1)
         self.throttle_sec = max(throttle_sec, 0.0)
+        self.cache = cache
+        self.cache_ttl_hours = cache_ttl_hours
+        self.cache_hits = 0
+
+    @staticmethod
+    def _cache_key(item: ContentItem, profile_id: str) -> str | None:
+        """Key on identity + content shape so edits invalidate the entry."""
+        import hashlib
+
+        title = (item.title or "").strip()
+        content = (item.content or "")[:2000].strip()
+        if not title and not content:
+            return None
+        identity = str(getattr(item, "canonical_key", None) or item.url or item.id)
+        digest = hashlib.sha256(
+            f"{title}\n{content}".encode("utf-8")
+        ).hexdigest()[:32]
+        return f"{profile_id}|{identity}|{digest}"
 
     @staticmethod
     def _parse_json_response(response: str) -> Optional[dict]:
@@ -99,6 +119,20 @@ class ContentAnalyzer:
         profile = await self.classifier.resolve(item)
         if item.processing:
             item.processing.artifacts.clear()
+
+        # Reuse a recent analysis of identical content instead of paying twice.
+        cache_key = self._cache_key(item, profile.id)
+        if self.cache is not None and cache_key:
+            cached = self.cache.cache_get(cache_key, ttl_hours=self.cache_ttl_hours)
+            if isinstance(cached, dict):
+                try:
+                    analysis = ContentAnalysis.model_validate(cached)
+                except ValidationError:
+                    analysis = None
+                if analysis is not None and item.processing:
+                    item.processing.analysis = analysis
+                    self.cache_hits += 1
+                    return
 
         content_parts = split_content(item.content)
         selected_content = select_content(
@@ -180,6 +214,16 @@ class ContentAnalyzer:
 
         if item.processing:
             item.processing.analysis = result
+            if self.cache is not None and cache_key:
+                try:
+                    self.cache.cache_put(
+                        cache_key,
+                        result.model_dump(mode="json"),
+                        profile_id=profile.id,
+                    )
+                except Exception:
+                    # Cache is an optimisation; never fail analysis over it.
+                    pass
 
     @classmethod
     def _validate_analysis_response(

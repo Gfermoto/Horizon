@@ -7,13 +7,18 @@
 > **What we add on top of upstream**
 > - **Cross-day published memory** — skip items already covered in recent digests (URL + near-duplicate titles)
 > - **AI topic dedup against already-published headlines** — catch paraphrased reprints (`life.ru` vs regional mirror, etc.)
+> - **Durable SQLite state** (`state.db`) — event memory with `is_update` detection, LLM analysis cache, per-source health
+> - **Cost control** — zero-LLM pre-filter, analysis cache, and hard token/cost ceilings per run
+> - **Versioned JSON export** (`digest.json` + `run_report.json`) for publishers and dashboards
+> - **Scraper plugin API** — `entry_points` + declarative `json_feed` sources, so any JSON API becomes a source
 > - **Harder RSS / extraction path** — more resilient fetch/extract for messy feeds
-> - Small token / enricher / trafilatura fixes used in long-running channels
+>
+> **Docs:** [docs/FORK_ARCHITECTURE.md](docs/FORK_ARCHITECTURE.md) — data flow, config reference, plugin example.
 >
 > **Used by:** [Dawnwire](https://github.com/Gfermoto/Dawnwire) (private product: Telegram publisher + control plane). This engine repo stays open so others can reuse the anti-spam digests work without opening the product.
 >
 > **Track upstream:** `git remote add upstream https://github.com/Thysrael/Horizon.git && git fetch upstream`  
-> Key entry points: `src/processing/published_memory.py`, `src/orchestrator.py` (`drop_already_published`, history filter).
+> Key entry points: `src/storage/state.py`, `src/processing/published_memory.py`, `src/processing/prefilter.py`, `src/export/json_digest.py`, `src/scrapers/registry.py`.
 
 ---
 

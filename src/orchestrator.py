@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -15,6 +16,7 @@ from rich.console import Console
 from .console_icons import get_icons
 from .models import Config, ContentItem
 from .storage.manager import StorageManager, safe_output_path
+from .storage.state import StateStore, bootstrap_from_summaries, default_state_path
 from .services.email import EmailManager
 from .services.webhook import WebhookNotifier
 from .services.wechat import WeChatNotifier
@@ -30,8 +32,10 @@ from .scrapers.openbb import OpenBBScraper
 from .scrapers.ossinsight import OSSInsightScraper
 from .scrapers.gdelt import GDELTScraper
 from .scrapers.google_news import GoogleNewsScraper
+from .scrapers.registry import get_scraper_plugin
 from .ai.client import AIClient, create_ai_client
 from .ai.errors import AIProviderUnavailableError
+from .ai.tokens import BudgetGuard
 from .ai.analyzer import ContentAnalyzer
 from .ai.summarizer import DailySummarizer
 from .ai.enricher import ContentEnricher, EnrichmentBatchResult
@@ -113,7 +117,7 @@ class SourceFetchOutcome:
     """Result of fetching one configured source."""
 
     source_name: str
-    status: Literal["success", "empty", "partial_failure", "failure"]
+    status: Literal["success", "empty", "partial_failure", "failure", "skipped_cooldown"]
     items: List[ContentItem] = field(default_factory=list)
     error: Optional[str] = None
     failures: Dict[str, str] = field(default_factory=dict)
@@ -152,8 +156,13 @@ class FetchReport:
         return sum(outcome.status in {"failure", "partial_failure"} for outcome in self.outcomes)
 
     @property
+    def skipped_count(self) -> int:
+        return sum(1 for outcome in self.outcomes if outcome.status == "skipped_cooldown")
+
+    @property
     def all_failed(self) -> bool:
-        return bool(self.outcomes) and all(outcome.status == "failure" for outcome in self.outcomes)
+        attempted = [o for o in self.outcomes if o.status != "skipped_cooldown"]
+        return bool(attempted) and all(outcome.status == "failure" for outcome in attempted)
 
     def failure_message(self) -> str:
         failures = "; ".join(
@@ -171,6 +180,9 @@ class FetchReport:
             "empty": sum(outcome.status == "empty" for outcome in self.outcomes),
             "failed": self.failed_count,
             "partial_failure": sum(outcome.status == "partial_failure" for outcome in self.outcomes),
+            "skipped_cooldown": sum(
+                1 for outcome in self.outcomes if outcome.status == "skipped_cooldown"
+            ),
             "item_count": sum(len(outcome.items) for outcome in self.outcomes),
             "sources": [outcome.to_dict() for outcome in self.outcomes],
         }
@@ -233,6 +245,41 @@ class HorizonOrchestrator:
             else None
         )
         self.last_fetch_report: Optional[FetchReport] = None
+        self.run_counters: Dict[str, int] = {
+            "fetched": 0,
+            "memory_skipped": 0,
+            "memory_updates": 0,
+            "analyzed": 0,
+            "event_skipped": 0,
+        }
+        self._state_store: Optional[StateStore] = None
+        self._budget = BudgetGuard(
+            max_total_tokens=getattr(config.ai, "max_total_tokens", None),
+            max_cost_usd=getattr(config.ai, "max_cost_usd", None),
+            usd_per_million_tokens=float(
+                getattr(config.ai, "usd_per_million_tokens", 1.0) or 1.0
+            ),
+        )
+        self._budget_report: Dict[str, object] = {}
+
+    @property
+    def state_store(self) -> Optional[StateStore]:
+        """Durable SQLite state for this data directory (None when disabled)."""
+        config = getattr(self, "config", None)
+        if not getattr(getattr(config, "collection", None), "state_enabled", True):
+            return None
+        if getattr(self, "_state_store", None) is None:
+            data_dir = getattr(getattr(self, "storage", None), "data_dir", None)
+            if data_dir is None:
+                return None
+            self._state_store = StateStore(default_state_path(data_dir))
+        return self._state_store
+
+    def close_state(self) -> None:
+        """Flush and close the state store if it was opened during this run."""
+        if getattr(self, "_state_store", None) is not None:
+            self._state_store.close()
+            self._state_store = None
 
     @cached_property
     def ai_client(self) -> AIClient:
@@ -261,12 +308,28 @@ class HorizonOrchestrator:
             self.email_manager.check_subscriptions(self.storage)
 
         try:
+            # 0. One-time import of existing Markdown digests into state.db so a
+            # fresh install keeps its history instead of starting empty.
+            state = self.state_store
+            if state is not None:
+                summaries_dir_for_bootstrap = getattr(self.storage, "summaries_dir", None)
+                imported = bootstrap_from_summaries(
+                    state, summaries_dir_for_bootstrap
+                )
+                if imported:
+                    self.console.print(
+                        f"   Imported {imported} historical items into state.db\n"
+                    )
+
             # 1. Determine time window
             since = self._determine_time_window(force_hours)
             self.console.print(
                 f"{self.icons['date']} Fetching content since: "
                 f"{since.strftime('%Y-%m-%d %H:%M:%S')}\n"
             )
+            budget = getattr(self, "_budget", None)
+            if budget is not None:
+                budget.reset()
 
             # 2. Fetch content from all sources
             all_items = await self.fetch_all_sources(since)
@@ -275,9 +338,19 @@ class HorizonOrchestrator:
             )
 
             if self.last_fetch_report and self.last_fetch_report.all_failed:
-                raise RuntimeError(self.last_fetch_report.failure_message())
+                message = self.last_fetch_report.failure_message()
+                if getattr(self.config.collection, "tolerate_total_failure", False):
+                    # Degraded but not fatal: keep scheduling stable and let the
+                    # run_report explain what happened.
+                    self.console.print(
+                        f"[yellow]{self.icons['warning']} {message}; "
+                        "continuing with whatever was fetched[/yellow]"
+                    )
+                    self.run_counters["all_sources_failed"] = 1
+                else:
+                    raise RuntimeError(message)
 
-            if self.config.collection.exclude_urls:
+            if getattr(self.config.collection, "exclude_urls", None):
                 excluded_keys = {
                     _deduplication_url_key(u)
                     for u in self.config.collection.exclude_urls
@@ -295,22 +368,45 @@ class HorizonOrchestrator:
                     )
 
             # Cross-day memory: same story under a new outlet URL must not re-enter.
-            from .processing.published_memory import filter_new_items
+            # Level 1+2 (identity + headline) run before any LLM call; level 3
+            # (event key) runs after analysis below.
+            from .processing.published_memory import split_by_memory
 
             exclude_fps = list(
                 getattr(self.config.collection, "exclude_title_fingerprints", None) or []
             )
+            memory_days = int(getattr(self.config.collection, "memory_days", 30) or 30)
+            state = self.state_store
+            summaries_dir = getattr(getattr(self, "storage", None), "summaries_dir", None)
             before_memory = len(all_items)
-            all_items, memory_hits = filter_new_items(
+            split = split_by_memory(
                 all_items,
-                self.storage.summaries_dir,
-                exclude_urls=self.config.collection.exclude_urls or [],
+                summaries_dir,
+                days=memory_days,
+                exclude_urls=getattr(self.config.collection, "exclude_urls", None) or [],
                 exclude_fingerprints=exclude_fps,
+                store=state,
             )
-            if memory_hits:
+            all_items = split.fresh + split.updates
+            if split.updates:
+                self.console.print(
+                    f"   {len(split.updates)} items are updates of published material\n"
+                )
+            if split.duplicates:
                 self.console.print(
                     f"   Skipped {before_memory - len(all_items)} items already in digest history\n"
                 )
+            counters = getattr(self, "run_counters", None)
+            if counters is None:
+                counters = self.run_counters = {
+                    "fetched": 0,
+                    "memory_skipped": 0,
+                    "memory_updates": 0,
+                    "analyzed": 0,
+                    "event_skipped": 0,
+                }
+            counters["memory_skipped"] = len(split.duplicates)
+            counters["memory_updates"] = len(split.updates)
 
             if not all_items:
                 self.console.print("[yellow]No new content found. Exiting.[/yellow]")
@@ -325,11 +421,66 @@ class HorizonOrchestrator:
                     f"→ {len(merged_items)} unique items\n"
                 )
 
+            # 3b. Free pre-filter: drop noise before spending a single token.
+            from .processing.prefilter import apply_prefilter
+
+            prefiltered = apply_prefilter(
+                merged_items,
+                must_match=getattr(self.config.collection, "must_match", None) or [],
+                exclude_patterns=getattr(self.config.collection, "exclude_patterns", None) or [],
+                min_content_chars=int(
+                    getattr(self.config.collection, "min_content_chars", 0) or 0
+                ),
+                max_items_to_analyze=int(
+                    getattr(self.config.collection, "max_items_to_analyze", 0) or 0
+                ),
+            )
+            if prefiltered.dropped_total:
+                self.console.print(
+                    f"   Pre-filter kept {len(prefiltered.items)} of "
+                    f"{len(prefiltered.items) + prefiltered.dropped_total} "
+                    f"(off-topic {prefiltered.dropped_must_match}, "
+                    f"noise {prefiltered.dropped_exclude}, "
+                    f"short {prefiltered.dropped_min_content}, "
+                    f"cap {prefiltered.dropped_cap})\n"
+                )
+            merged_items = prefiltered.items
+            counters = getattr(self, "run_counters", None)
+            if counters is not None:
+                counters["prefiltered"] = prefiltered.dropped_total
+
+            if not merged_items:
+                self.console.print("[yellow]Nothing passed the pre-filter. Exiting.[/yellow]")
+                return
+
             # 4. Analyze with AI
             analyzed_items = await self.analyze_items(merged_items)
             self.console.print(
                 f"{self.icons['ai']} Analyzed {len(analyzed_items)} items with AI\n"
             )
+            self.run_counters["analyzed"] = len(analyzed_items)
+
+            # 4b. Level 3 memory: event keys now exist, so reprints that share no
+            # vocabulary with the original headline can still be dropped.
+            if state is not None and analyzed_items:
+                event_split = split_by_memory(
+                    analyzed_items,
+                    summaries_dir,
+                    days=memory_days,
+                    store=state,
+                    check_event_keys=True,
+                )
+                if event_split.duplicates:
+                    self.console.print(
+                        f"   Skipped {len(event_split.duplicates)} items matching "
+                        "already-published events\n"
+                    )
+                    analyzed_items = event_split.fresh + event_split.updates
+                    self.run_counters["event_skipped"] = len(event_split.duplicates)
+
+            if not analyzed_items:
+                self.console.print("[yellow]No new content found. Exiting.[/yellow]")
+                return
 
             # 5. Filter, deduplicate, and balance the digest
             filtering_result = await self.select_digest_items(
@@ -376,6 +527,31 @@ class HorizonOrchestrator:
                 self.console.print(
                     f"{self.icons['save']} Saved {lang.upper()} summary to: {summary_path}\n"
                 )
+
+                # Machine-readable companion: publishers and dashboards read
+                # this instead of re-parsing Markdown with regexes.
+                if getattr(self.config.digest, "export_json", True):
+                    json_path = self._write_digest_json(
+                        today, lang, language_items, len(all_items)
+                    )
+                    if json_path is not None:
+                        self.console.print(
+                            f"{self.icons['document']} Saved {lang.upper()} JSON digest to: "
+                            f"{json_path}\n"
+                        )
+
+                # Mark the delivered material as published so tomorrow's run
+                # cannot ship it again under another outlet URL.
+                if state is not None and lang == self.config.ai.languages[0]:
+                    from .processing.published_memory import remember_items
+
+                    remembered = remember_items(
+                        state, language_items, digest_date=today
+                    )
+                    if remembered:
+                        self.console.print(
+                            f"   Remembered {remembered} published items in state.db\n"
+                        )
 
                 # Copy to docs/ for GitHub Pages
                 try:
@@ -468,6 +644,17 @@ class HorizonOrchestrator:
                         f"[yellow]Could not write usage JSON: {exc}[/yellow]"
                     )
 
+            self._write_run_report(
+                date=datetime.now(timezone.utc).strftime("%Y-%m-%d"), status="success"
+            )
+            if budget is not None:
+                self._budget_report = budget.report()
+                if budget.truncated:
+                    self.console.print(
+                        f"[yellow]{self.icons['warning']} Budget truncated this run: "
+                        f"{budget.reason}[/yellow]"
+                    )
+
         except Exception as e:
             self.console.print(
                 f"[bold red]{self.icons['error']} Error: {e}[/bold red]"
@@ -485,11 +672,113 @@ class HorizonOrchestrator:
                     error_message=str(e),
                 )
 
+            self._write_run_report(
+                date=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                status="failure",
+                error=str(e),
+            )
             raise
 
     def _determine_time_window(self, force_hours: Optional[int] = None) -> datetime:
         hours = force_hours if force_hours is not None else self.config.collection.time_window_hours
         return datetime.now(timezone.utc) - timedelta(hours=hours)
+
+    def _write_digest_json(
+        self,
+        date: str,
+        language: str,
+        items: List[ContentItem],
+        total_fetched: int,
+    ) -> Optional[Path]:
+        """Write the versioned JSON digest next to the Markdown one."""
+        from .export.json_digest import build_digest_payload, write_digest_json
+
+        try:
+            payload = build_digest_payload(
+                date=date,
+                language=language,
+                items=items,
+                total_fetched=total_fetched,
+                window_hours=int(self.config.collection.time_window_hours),
+                counters=self.run_counters,
+                sources_health=self._sources_health_rows(),
+                usage=self._usage_payload(),
+                budget=getattr(self, "_budget_report", {}),
+            )
+            return write_digest_json(
+                Path(self.storage.summaries_dir), date, language, payload
+            )
+        except Exception as exc:  # never fail a run over the optional export
+            self.console.print(
+                f"[yellow]{self.icons['warning']} JSON digest export failed: {exc}[/yellow]"
+            )
+            return None
+
+    def _usage_payload(self) -> Dict[str, object]:
+        try:
+            usage = get_usage_snapshot()
+        except Exception:
+            return {}
+        return {
+            "total_tokens": usage.total_tokens,
+            "input_tokens": usage.total_input_tokens,
+            "output_tokens": usage.total_output_tokens,
+            "per_provider": {
+                provider: {
+                    "total": record.total,
+                    "input_tokens": record.input_tokens,
+                    "output_tokens": record.output_tokens,
+                }
+                for provider, record in usage.per_provider.items()
+            },
+        }
+
+    def _sources_health_rows(self) -> List[Dict[str, object]]:
+        state = self.state_store
+        if state is None:
+            return [
+                outcome.to_dict()
+                for outcome in (self.last_fetch_report.outcomes if self.last_fetch_report else [])
+            ]
+        try:
+            return [health.to_dict() for health in state.health_all()]
+        except Exception:
+            return []
+
+    def _write_run_report(self, *, date: str, status: str, error: str | None = None) -> None:
+        """Persist per-run diagnostics for operators and downstream schedulers."""
+        digest_cfg = getattr(self.config, "digest", None)
+        if digest_cfg is not None and not getattr(digest_cfg, "write_run_report", True):
+            return
+        storage = getattr(self, "storage", None)
+        summaries_dir = getattr(storage, "summaries_dir", None) if storage else None
+        if summaries_dir is None:
+            return
+        from .export.json_digest import write_run_report
+
+        window_hours = int(
+            getattr(getattr(self.config, "collection", None), "time_window_hours", 24) or 24
+        )
+        payload: Dict[str, object] = {
+            "schema_version": 1,
+            "date": date,
+            "status": status,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "window_hours": window_hours,
+            "counters": dict(self.run_counters),
+            "fetch": self.last_fetch_report.to_dict() if self.last_fetch_report else {},
+            "sources_health": self._sources_health_rows(),
+            "usage": self._usage_payload(),
+            "budget": getattr(self, "_budget_report", {}),
+        }
+        if error:
+            payload["error"] = error
+        try:
+            write_run_report(Path(summaries_dir), payload)
+        except Exception as exc:
+            self.console.print(
+                f"[yellow]{self.icons['warning']} run_report.json write failed: {exc}[/yellow]"
+            )
 
     async def fetch_all_sources(self, since: datetime) -> List[ContentItem]:
         """Fetch content from all configured sources.
@@ -503,21 +792,37 @@ class HorizonOrchestrator:
             List[ContentItem]: All fetched items
         """
         self.last_fetch_report = None
+        parked: List[SourceFetchOutcome] = []
         async with httpx.AsyncClient(timeout=30.0) as client:
             tasks = []
 
+            def _skip_if_parked(name: str) -> bool:
+                if not self._source_in_cooldown(name):
+                    return False
+                self.console.print(
+                    f"[yellow]{self.icons['warning']} Skipping {name}: in cooldown[/yellow]"
+                )
+                parked.append(
+                    SourceFetchOutcome(
+                        source_name=name,
+                        status="skipped_cooldown",
+                        error="circuit breaker cooldown",
+                    )
+                )
+                return True
+
             # GitHub sources
-            if self.config.sources.github:
+            if self.config.sources.github and not _skip_if_parked("GitHub"):
                 github_scraper = GitHubScraper(self.config.sources.github, client)
                 tasks.append(self._fetch_with_progress("GitHub", github_scraper, since))
 
             # Hacker News
-            if self.config.sources.hackernews.enabled:
+            if self.config.sources.hackernews.enabled and not _skip_if_parked("Hacker News"):
                 hn_scraper = HackerNewsScraper(self.config.sources.hackernews, client)
                 tasks.append(self._fetch_with_progress("Hacker News", hn_scraper, since))
 
             # RSS feeds
-            if self.config.sources.rss:
+            if self.config.sources.rss and not _skip_if_parked("RSS Feeds"):
                 from .extractors import ExtractorRegistry
                 rss_scraper = RSSScraper(
                     self.config.sources.rss,
@@ -527,17 +832,21 @@ class HorizonOrchestrator:
                 tasks.append(self._fetch_with_progress("RSS Feeds", rss_scraper, since))
 
             # Reddit
-            if self.config.sources.reddit.enabled:
+            if self.config.sources.reddit.enabled and not _skip_if_parked("Reddit"):
                 reddit_scraper = RedditScraper(self.config.sources.reddit, client)
                 tasks.append(self._fetch_with_progress("Reddit", reddit_scraper, since))
 
             # Telegram
-            if self.config.sources.telegram.enabled:
+            if self.config.sources.telegram.enabled and not _skip_if_parked("Telegram"):
                 telegram_scraper = TelegramScraper(self.config.sources.telegram, client)
                 tasks.append(self._fetch_with_progress("Telegram", telegram_scraper, since))
 
             # Twitter (Apify or Playwright mode)
-            if self.config.sources.twitter and self.config.sources.twitter.enabled:
+            if (
+                self.config.sources.twitter
+                and self.config.sources.twitter.enabled
+                and not _skip_if_parked("Twitter")
+            ):
                 tw_cfg = self.config.sources.twitter
                 if tw_cfg.mode == "playwright":
                     twitter_scraper = TwitterPlaywrightScraper(tw_cfg)
@@ -546,28 +855,62 @@ class HorizonOrchestrator:
                 tasks.append(self._fetch_with_progress("Twitter", twitter_scraper, since))
 
             # OpenBB (financial news / filings via the OpenBB Platform SDK)
-            if self.config.sources.openbb and self.config.sources.openbb.enabled:
+            if (
+                self.config.sources.openbb
+                and self.config.sources.openbb.enabled
+                and not _skip_if_parked("OpenBB")
+            ):
                 openbb_scraper = OpenBBScraper(self.config.sources.openbb, client)
                 tasks.append(self._fetch_with_progress("OpenBB", openbb_scraper, since))
 
             # OSS Insight trending repos
-            if self.config.sources.ossinsight and self.config.sources.ossinsight.enabled:
+            if (
+                self.config.sources.ossinsight
+                and self.config.sources.ossinsight.enabled
+                and not _skip_if_parked("OSS Insight")
+            ):
                 oss_scraper = OSSInsightScraper(self.config.sources.ossinsight, client)
                 tasks.append(self._fetch_with_progress("OSS Insight", oss_scraper, since))
 
             # GDELT 2.0 DOC API (key-less global news)
-            if self.config.sources.gdelt and self.config.sources.gdelt.enabled:
+            if (
+                self.config.sources.gdelt
+                and self.config.sources.gdelt.enabled
+                and not _skip_if_parked("GDELT")
+            ):
                 gdelt_scraper = GDELTScraper(self.config.sources.gdelt, client)
                 tasks.append(self._fetch_with_progress("GDELT", gdelt_scraper, since))
 
             # Google News RSS (key-less news search)
-            if self.config.sources.google_news and self.config.sources.google_news.enabled:
+            if (
+                self.config.sources.google_news
+                and self.config.sources.google_news.enabled
+                and not _skip_if_parked("Google News")
+            ):
                 gn_scraper = GoogleNewsScraper(self.config.sources.google_news, client)
                 tasks.append(self._fetch_with_progress("Google News", gn_scraper, since))
 
+            # Custom sources: declarative json_feed and installed plugins.
+            for custom in getattr(self.config.sources, "custom", None) or []:
+                if not getattr(custom, "enabled", True):
+                    continue
+                label = custom.name or custom.type
+                if _skip_if_parked(label):
+                    continue
+                plugin = get_scraper_plugin(custom.type)
+                payload = dict(custom.config or {})
+                payload.setdefault("type", custom.type)
+                payload.setdefault("name", label)
+                payload.setdefault("profile", custom.profile)
+                payload.setdefault("custom_type", custom.type)
+                if custom.category and "category" not in payload:
+                    payload["category"] = custom.category
+                scraper = plugin.build(payload, client)
+                tasks.append(self._fetch_with_progress(label, scraper, since))
+
             # Fetch all concurrently
             outcomes = await asyncio.gather(*tasks)
-            self.last_fetch_report = FetchReport(outcomes=list(outcomes))
+            self.last_fetch_report = FetchReport(outcomes=[*outcomes, *parked])
 
             # Flatten successful and empty outcomes; failures remain in the report.
             all_items: List[ContentItem] = []
@@ -590,19 +933,36 @@ class HorizonOrchestrator:
             SourceFetchOutcome: Named fetch result and diagnostics
         """
         self.console.print(f"{self.icons['fetch']} Fetching from {name}...")
+        started = time.monotonic()
         try:
             result = await scraper.fetch(since)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             self.console.print(f"[red]   Failed to fetch {name}: {error}[/red]")
+            self._record_source_health(
+                name, ok=False, error=error, latency_ms=(time.monotonic() - started) * 1000
+            )
             return SourceFetchOutcome(
                 source_name=name,
                 status="failure",
                 error=error,
             )
 
+        latency_ms = (time.monotonic() - started) * 1000
         items = result.items
         self.console.print(f"   Found {len(items)} items from {name}")
+        ok = result.status != "failure"
+        self._record_source_health(
+            name,
+            ok=ok,
+            latency_ms=latency_ms,
+            fetched=len(items),
+            error=(
+                "; ".join(f"{source}: {error}" for source, error in result.failures.items())
+                if not ok and result.failures
+                else None
+            ),
+        )
         for source, error in result.failures.items():
             self.console.print(f"[yellow]   {name}/{source}: {error}[/yellow]")
 
@@ -621,6 +981,57 @@ class HorizonOrchestrator:
             error="; ".join(f"{source}: {error}" for source, error in result.failures.items()) or None,
             failures=result.failures,
         )
+
+    def _record_source_health(
+        self,
+        name: str,
+        *,
+        ok: bool,
+        latency_ms: float | None = None,
+        fetched: int = 0,
+        error: str | None = None,
+    ) -> None:
+        """Persist the fetch outcome so the breaker and run report see it."""
+        state = self.state_store
+        if state is None:
+            return
+        collection = getattr(getattr(self, "config", None), "collection", None)
+        try:
+            failures_before = state.health_get(name).consecutive_failures
+            cooldown = 0.0
+            max_failures = int(getattr(collection, "max_consecutive_failures", 0) or 0)
+            if not ok and max_failures > 0 and failures_before + 1 >= max_failures:
+                from .storage.state import cooldown_seconds_for
+
+                cooldown = cooldown_seconds_for(
+                    failures_before + 1,
+                    float(getattr(collection, "cooldown_base_hours", 6.0) or 6.0),
+                )
+            state.health_record(
+                name,
+                ok=ok,
+                latency_ms=latency_ms,
+                fetched=fetched,
+                error=error,
+                cooldown_seconds=cooldown,
+            )
+            if cooldown:
+                self.console.print(
+                    f"[yellow]   {name} parked for {cooldown / 3600:.0f}h after "
+                    f"{failures_before + 1} consecutive failures[/yellow]"
+                )
+        except Exception:
+            # Health bookkeeping must never break a run.
+            pass
+
+    def _source_in_cooldown(self, name: str) -> bool:
+        state = self.state_store
+        if state is None:
+            return False
+        try:
+            return state.health_get(name).in_cooldown
+        except Exception:
+            return False
 
     @staticmethod
     def _sub_source_label(item: ContentItem) -> str:
@@ -842,9 +1253,16 @@ class HorizonOrchestrator:
         )
         from .processing.published_memory import history_titles
 
-        prior_titles = history_titles(self.storage.summaries_dir, days=days)
+        storage = getattr(self, "storage", None)
+        summaries_dir = getattr(storage, "summaries_dir", None) if storage else None
+        state = None
+        try:
+            state = self.state_store
+        except Exception:
+            state = None
+        prior_titles = history_titles(summaries_dir, days=days, store=state)
         extra_fps = list(
-            getattr(self.config.collection, "exclude_title_fingerprints", None) or []
+            (getattr(getattr(self.config, "collection", None), "exclude_title_fingerprints", None) or [])
         )
         # Fingerprints may be raw titles or already-normalized; keep as phantom titles.
         prior_titles = list(dict.fromkeys([*prior_titles, *[fp for fp in extra_fps if fp]]))
@@ -1232,6 +1650,15 @@ class HorizonOrchestrator:
         if not items:
             return EnrichmentBatchResult()
 
+        budget = getattr(self, "_budget", None)
+        if budget is not None and budget.exhausted():
+            self.console.print(
+                f"[yellow]{self.icons['warning']} Skipping enrichment: "
+                f"{budget.reason}[/yellow]"
+            )
+            self._budget_report = budget.report()
+            return EnrichmentBatchResult()
+
         self.console.print(
             f"{self.icons['enrich']} Enriching with background knowledge..."
         )
@@ -1265,6 +1692,16 @@ class HorizonOrchestrator:
         Returns:
             List[ContentItem]: Analyzed items
         """
+        budget = getattr(self, "_budget", None)
+        if budget is not None and not budget.allow(stage="analyze", estimated_tokens=0):
+            if budget.exhausted():
+                self.console.print(
+                    f"[yellow]{self.icons['warning']} Skipping AI analysis: "
+                    f"{budget.reason}[/yellow]"
+                )
+                self._budget_report = budget.report()
+                return []
+
         self.console.print(f"{self.icons['ai']} Analyzing content with AI...")
 
         ai_client = self.ai_client
@@ -1272,6 +1709,18 @@ class HorizonOrchestrator:
             ai_client, self.profiles, console=self.console,
             concurrency=self.config.ai.analysis_concurrency,
             throttle_sec=self.config.ai.throttle_sec,
+            cache=self.state_store,
+            cache_ttl_hours=float(
+                getattr(self.config.collection, "analysis_cache_ttl_hours", 72.0) or 0.0
+            ),
         )
 
-        return await analyzer.analyze_batch(items)
+        analyzed = await analyzer.analyze_batch(items)
+        if analyzer.cache_hits:
+            self.console.print(
+                f"   Reused {analyzer.cache_hits} cached analyses (no tokens spent)"
+            )
+            counters = getattr(self, "run_counters", None)
+            if counters is not None:
+                counters["cache_hits"] = analyzer.cache_hits
+        return analyzed

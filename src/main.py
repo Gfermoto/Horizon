@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import os
 import shlex
 import sys
 from pathlib import Path
@@ -43,6 +44,29 @@ def _hours_argument(value: str) -> int:
         return int(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"invalid int value: {value!r}") from exc
+
+
+def _preflight_ai_credentials(config) -> str | None:
+    """Return an error message when the configured AI provider cannot run.
+
+    Providers that authenticate without an API key (local Ollama, ChatGPT OAuth)
+    are skipped deliberately: they are valid setups, not missing credentials.
+    """
+    ai = config.ai
+    if ai.provider in {AIProvider.OLLAMA, AIProvider.OPENAI_CHATGPT}:
+        return None
+    env_name = (ai.api_key_env or "").strip()
+    if not env_name:
+        return (
+            "ai.api_key_env is empty. Set it to the environment variable name that "
+            "holds your provider key (for example DEEPSEEK_API_KEY)."
+        )
+    if not os.getenv(env_name):
+        return (
+            f"{env_name} is not set. Export it before running Horizon "
+            f"(the value must be the key itself, not its name)."
+        )
+    return None
 
 
 def main():
@@ -118,6 +142,14 @@ def main():
             window = collection_hours(config.collection.time_window_hours, args.hours)
         except ValueError as exc:
             console.print(f"[bold red]{icons['error']} {exc}[/bold red]")
+            sys.exit(2)
+
+        # Fail fast on a missing AI credential: a run that fetches hundreds of
+        # feeds and only then discovers it cannot analyse them wastes minutes
+        # and rate-limit budget for nothing.
+        preflight_error = _preflight_ai_credentials(config)
+        if preflight_error:
+            console.print(f"[bold red]{icons['error']} {preflight_error}[/bold red]")
             sys.exit(2)
 
         orchestrator = HorizonOrchestrator(config, storage, console=console)
