@@ -20,7 +20,17 @@ GROUNDING_RULES = f"""- Treat the source item as the primary account of what hap
 def target_language_instruction(language: str) -> str:
     if language.lower() == "zh":
         return "Simplified Chinese (language tag `zh`)"
-    return f"language `{language}`"
+    if language.lower() == "ru":
+        return (
+            "Russian (language tag `ru`). Translate the title and every block into Russian. "
+            "Keep product names, standards, and URLs in their original form, but never leave "
+            "the full title or body in Korean, Japanese, Chinese, or another source language."
+        )
+    return (
+        f"language `{language}`. Translate the title and every block into that language. "
+        "Keep product names and URLs in their original form, but never leave the full title "
+        "or body in a different source language."
+    )
 
 
 def tool_planning_prompt(blocks: list[ProfileBlock]) -> str:

@@ -20,7 +20,7 @@ from tenacity import retry, retry_if_exception_type, retry_if_not_exception_type
 
 from .client import AIClient
 from .errors import AIProviderUnavailableError
-from .localization import normalize_language
+from .localization import assert_matches_language, normalize_language
 from .prompting.enrichment import (
     MAX_TOOL_REQUESTS,
     artifact_prompt,
@@ -236,9 +236,15 @@ class ContentEnricher:
             self._expand_request_source_refs(generated.blocks, tool_results)
             self._validate_blocks(generated.blocks, profile, tool_results)
             generated.title = normalize_language(generated.title, language)
+            assert_matches_language(generated.title, language, label="title")
             for block in generated.blocks:
                 block.title = normalize_language(block.title, language)
                 block.content = normalize_language(block.content, language)
+                assert_matches_language(
+                    f"{block.title}\n{block.content}",
+                    language,
+                    label=f"block {block.id}",
+                )
             referenced = {
                 source_id
                 for block in generated.blocks
@@ -358,6 +364,13 @@ class ContentEnricher:
                     raise ValueError(
                         "missing required blocks: " + ", ".join(sorted(missing))
                     )
+                assert_matches_language(generated.title, language, label="title")
+                for generated_block in generated.blocks:
+                    assert_matches_language(
+                        f"{generated_block.title}\n{generated_block.content}",
+                        language,
+                        label=f"block {generated_block.id}",
+                    )
 
             generated = await self._complete_model(
                 GeneratedArtifact,
@@ -411,6 +424,13 @@ class ContentEnricher:
                     raise ValueError(
                         f"block ID {generated.block.id} does not match {block.id}"
                     )
+                if getattr(generated, "title", None):
+                    assert_matches_language(generated.title, language, label="title")
+                assert_matches_language(
+                    f"{generated.block.title}\n{generated.block.content}",
+                    language,
+                    label=f"block {block.id}",
+                )
 
             generated = await self._complete_model(
                 response_model,
