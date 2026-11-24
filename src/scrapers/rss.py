@@ -157,6 +157,12 @@ def _matches_topic_query(text: str, query: str) -> bool:
 RATE_LIMIT_RETRIES = 3
 RATE_LIMIT_BACKOFF_SEC = 15.0
 RATE_LIMIT_MAX_WAIT_SEC = 60.0
+# A host that is unreachable (blocked, no route) will not recover inside one run,
+# so connection failures get far fewer, shorter attempts. Without this a blocked
+# host such as Google News from a Russian network burned minutes of every run
+# waiting on retries that could never succeed.
+TRANSPORT_RETRIES = 1
+TRANSPORT_BACKOFF_SEC = 3.0
 
 
 def _rate_limit_delay(response: httpx.Response, attempt: int) -> float:
@@ -266,16 +272,18 @@ class RSSScraper(BaseScraper):
                 last_transport_error = None
             except httpx.TransportError as exc:
                 last_transport_error = exc
-                if attempt == RATE_LIMIT_RETRIES:
+                # Unreachable host: retrying inside one run rarely helps, so the
+                # transport budget is deliberately short.
+                if attempt >= TRANSPORT_RETRIES:
                     raise
-                delay = RATE_LIMIT_BACKOFF_SEC * (attempt + 1)
+                delay = TRANSPORT_BACKOFF_SEC * (attempt + 1)
                 logger.info(
                     "RSS feed %s transport error (%s); retrying in %.0fs (%d/%d)",
                     source.name,
                     type(exc).__name__,
                     delay,
                     attempt + 1,
-                    RATE_LIMIT_RETRIES,
+                    TRANSPORT_RETRIES,
                 )
                 await asyncio.sleep(delay)
                 continue

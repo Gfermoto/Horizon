@@ -666,6 +666,17 @@ class CollectionConfig(BaseModel):
     max_consecutive_failures: int = Field(default=0, ge=0)
     # Base cooldown for the breaker; escalates 6h -> 24h -> 72h when > 0.
     cooldown_base_hours: float = Field(default=6.0, ge=0)
+    # A source that fetches but never contributes is muted after this many
+    # consecutive runs below ``min_source_yield``. Advisory, not destructive.
+    min_source_yield: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    mute_after_low_yield_runs: int = Field(default=0, ge=0)
+    # Connector bookkeeping written by the control plane: which external sources
+    # are active for this radar and which are present but disabled. The engine
+    # does not act on it, but rejecting it would fail every run that has any.
+    connectors: Optional[Dict[str, List[str]]] = None
+    # Per-request timeout for source fetching. A blocked host fails fast instead
+    # of stalling the run through long retries.
+    http_timeout_sec: float = Field(default=30.0, ge=5.0, le=120.0)
     # When every source fails, still finish the run instead of raising.
     tolerate_total_failure: bool = False
 

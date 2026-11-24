@@ -92,6 +92,18 @@ CREATE TABLE IF NOT EXISTS source_health (
 );
 """
 
+# Columns added after the first release. ``CREATE TABLE IF NOT EXISTS`` cannot
+# add them to an existing database, so they are ensured one by one.
+_HEALTH_MIGRATIONS: tuple[tuple[str, str], ...] = (
+    # How many items a source produced and how many survived the pre-filter. The
+    # ratio is what tells a dead feed apart from a noisy one.
+    ("total_kept", "INTEGER NOT NULL DEFAULT 0"),
+    ("yield_runs", "INTEGER NOT NULL DEFAULT 0"),
+    # Consecutive runs below the yield threshold, used by the mute rule.
+    ("low_yield_streak", "INTEGER NOT NULL DEFAULT 0"),
+    ("muted_reason", "TEXT"),
+)
+
 
 def default_state_path(data_dir: str | Path) -> Path:
     """Return the canonical ``state.db`` path for a Horizon data directory."""
@@ -154,10 +166,31 @@ class SourceHealth:
     total_fetched: int = 0
     avg_latency_ms: Optional[float] = None
     updated_at: float = field(default_factory=time.time)
+    # Yield accounting: fetched vs survived the pre-filter, per run.
+    total_kept: int = 0
+    yield_runs: int = 0
+    low_yield_streak: int = 0
+    muted_reason: Optional[str] = None
+
+    @property
+    def yield_ratio(self) -> Optional[float]:
+        """Share of fetched items that survived the pre-filter.
+
+        ``None`` until at least one run actually measured yield: a legacy row
+        with ``total_fetched`` from before this counter existed must not look
+        like a source that contributes nothing.
+        """
+        if self.yield_runs <= 0 or self.total_fetched <= 0:
+            return None
+        return round(self.total_kept / self.total_fetched, 3)
 
     @property
     def in_cooldown(self) -> bool:
         return self.cooldown_until is not None and self.cooldown_until > time.time()
+
+    @property
+    def muted(self) -> bool:
+        return bool(self.muted_reason)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -168,6 +201,12 @@ class SourceHealth:
             "last_ok_at": self.last_ok_at,
             "last_error": self.last_error,
             "total_fetched": self.total_fetched,
+            "total_kept": self.total_kept,
+            "yield_ratio": self.yield_ratio,
+            "yield_runs": self.yield_runs,
+            "low_yield_streak": self.low_yield_streak,
+            "muted": self.muted,
+            "muted_reason": self.muted_reason,
             "avg_latency_ms": self.avg_latency_ms,
         }
 
@@ -458,11 +497,37 @@ class StateStore:
     # ------------------------------------------------------------------
     def health_get(self, source_key: str) -> SourceHealth:
         conn = self.connect()
+        self._migrate_health(conn)
         row = conn.execute(
             "SELECT * FROM source_health WHERE source_key = ?", (source_key,)
         ).fetchone()
         if row is None:
             return SourceHealth(source_key=source_key)
+        return self._health_from_row(row)
+
+    @staticmethod
+    def _migrate_health(conn: sqlite3.Connection) -> None:
+        """Add post-release columns to an existing ``source_health`` table."""
+        existing = {
+            str(info[1]) for info in conn.execute("PRAGMA table_info(source_health)").fetchall()
+        }
+        for column, ddl in _HEALTH_MIGRATIONS:
+            if column in existing:
+                continue
+            try:
+                conn.execute(f"ALTER TABLE source_health ADD COLUMN {column} {ddl}")
+            except sqlite3.OperationalError:
+                # A concurrent process may have added it in between.
+                pass
+
+    @staticmethod
+    def _health_from_row(row: sqlite3.Row) -> SourceHealth:
+        def field(name: str, default=None):
+            try:
+                return row[name] if row[name] is not None else default
+            except (IndexError, KeyError):
+                return default
+
         return SourceHealth(
             source_key=str(row["source_key"]),
             consecutive_failures=int(row["consecutive_failures"] or 0),
@@ -472,26 +537,19 @@ class StateStore:
             total_fetched=int(row["total_fetched"] or 0),
             avg_latency_ms=row["avg_latency_ms"],
             updated_at=float(row["updated_at"] or time.time()),
+            total_kept=int(field("total_kept", 0) or 0),
+            yield_runs=int(field("yield_runs", 0) or 0),
+            low_yield_streak=int(field("low_yield_streak", 0) or 0),
+            muted_reason=field("muted_reason"),
         )
 
     def health_all(self) -> List[SourceHealth]:
         conn = self.connect()
+        self._migrate_health(conn)
         rows = conn.execute(
             "SELECT * FROM source_health ORDER BY source_key"
         ).fetchall()
-        return [
-            SourceHealth(
-                source_key=str(row["source_key"]),
-                consecutive_failures=int(row["consecutive_failures"] or 0),
-                cooldown_until=row["cooldown_until"],
-                last_ok_at=row["last_ok_at"],
-                last_error=row["last_error"],
-                total_fetched=int(row["total_fetched"] or 0),
-                avg_latency_ms=row["avg_latency_ms"],
-                updated_at=float(row["updated_at"] or time.time()),
-            )
-            for row in rows
-        ]
+        return [self._health_from_row(row) for row in rows]
 
     def health_record(
         self,
@@ -526,30 +584,99 @@ class StateStore:
         else:
             avg = current.avg_latency_ms
 
+        self._health_upsert(
+            source_key,
+            consecutive_failures=failures,
+            cooldown_until=cooldown_until,
+            last_ok_at=last_ok_at,
+            last_error=last_error,
+            total_fetched=current.total_fetched + max(0, int(fetched)),
+            avg_latency_ms=avg,
+            updated_at=now,
+            total_kept=current.total_kept,
+            yield_runs=current.yield_runs,
+            low_yield_streak=current.low_yield_streak,
+            muted_reason=current.muted_reason,
+        )
+        return self.health_get(source_key)
+
+    def health_record_yield(
+        self,
+        source_key: str,
+        *,
+        fetched: int,
+        kept: int,
+        min_yield: float | None = None,
+        mute_after: int = 3,
+    ) -> SourceHealth:
+        """Account how many fetched items survived the pre-filter.
+
+        A source that answers but never contributes is as useless as a dead one.
+        A streak of runs below ``min_yield`` marks it muted; the mark is advisory,
+        and the cabinet decides whether to disable the source.
+        """
+        current = self.health_get(source_key)
+        total_kept = current.total_kept + max(0, int(kept))
+        yield_runs = current.yield_runs + 1
+        streak = current.low_yield_streak
+        muted_reason = current.muted_reason
+
+        if min_yield is not None and fetched > 0:
+            ratio = max(0, int(kept)) / max(1, int(fetched))
+            streak = streak + 1 if ratio < float(min_yield) else 0
+            if mute_after > 0 and streak >= mute_after and not muted_reason:
+                muted_reason = f"low_yield:{ratio:.2f}<{float(min_yield):.2f}x{mute_after}"
+
+        self._health_upsert(
+            source_key,
+            consecutive_failures=current.consecutive_failures,
+            cooldown_until=current.cooldown_until,
+            last_ok_at=current.last_ok_at,
+            last_error=current.last_error,
+            total_fetched=current.total_fetched,
+            avg_latency_ms=current.avg_latency_ms,
+            updated_at=time.time(),
+            total_kept=total_kept,
+            yield_runs=yield_runs,
+            low_yield_streak=streak,
+            muted_reason=muted_reason,
+        )
+        return self.health_get(source_key)
+
+    def _health_upsert(self, source_key: str, **values: Any) -> None:
+        """Write every health column at once, so no field drifts out of sync."""
         conn = self.connect()
+        self._migrate_health(conn)
+        columns = (
+            "source_key",
+            "consecutive_failures",
+            "cooldown_until",
+            "last_ok_at",
+            "last_error",
+            "total_fetched",
+            "avg_latency_ms",
+            "updated_at",
+            "total_kept",
+            "yield_runs",
+            "low_yield_streak",
+            "muted_reason",
+        )
+        placeholders = ", ".join("?" for _ in columns)
+        updates = ", ".join(f"{name} = excluded.{name}" for name in columns[1:])
         conn.execute(
-            "INSERT INTO source_health ("
-            "source_key, consecutive_failures, cooldown_until, last_ok_at, last_error, "
-            "total_fetched, avg_latency_ms, updated_at"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(source_key) DO UPDATE SET "
-            "consecutive_failures = excluded.consecutive_failures, "
-            "cooldown_until = excluded.cooldown_until, "
-            "last_ok_at = excluded.last_ok_at, "
-            "last_error = excluded.last_error, "
-            "total_fetched = excluded.total_fetched, "
-            "avg_latency_ms = excluded.avg_latency_ms, "
-            "updated_at = excluded.updated_at",
-            (
-                source_key,
-                failures,
-                cooldown_until,
-                last_ok_at,
-                last_error,
-                current.total_fetched + max(0, int(fetched)),
-                avg,
-                now,
-            ),
+            f"INSERT INTO source_health ({', '.join(columns)}) VALUES ({placeholders}) "
+            f"ON CONFLICT(source_key) DO UPDATE SET {updates}",
+            (source_key, *[values.get(name) for name in columns[1:]]),
+        )
+
+    def health_unmute(self, source_key: str) -> SourceHealth:
+        """Clear the mute mark and the low-yield streak for one source."""
+        conn = self.connect()
+        self._migrate_health(conn)
+        conn.execute(
+            "UPDATE source_health SET muted_reason = NULL, low_yield_streak = 0 "
+            "WHERE source_key = ?",
+            (source_key,),
         )
         return self.health_get(source_key)
 

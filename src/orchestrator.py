@@ -172,6 +172,10 @@ class FetchReport:
         )
         return f"All {len(self.outcomes)} attempted sources failed ({failures})"
 
+    def all_items(self) -> List[ContentItem]:
+        """Every item any source returned, before any dedup or filtering."""
+        return [item for outcome in self.outcomes for item in outcome.items]
+
     def to_dict(self) -> Dict[str, object]:
         return {
             "status": self.status,
@@ -409,6 +413,11 @@ class HorizonOrchestrator:
             counters["memory_updates"] = len(split.updates)
 
             if not all_items:
+                # Nothing new, but the sources did answer: record that so a healthy
+                # radar never looks like one that was never measured.
+                self._record_source_yields(
+                    [], self.last_fetch_report.all_items() if self.last_fetch_report else []
+                )
                 self.console.print("[yellow]No new content found. Exiting.[/yellow]")
                 return
 
@@ -448,6 +457,7 @@ class HorizonOrchestrator:
             counters = getattr(self, "run_counters", None)
             if counters is not None:
                 counters["prefiltered"] = prefiltered.dropped_total
+            self._record_source_yields(prefiltered.items, all_items)
 
             if not merged_items:
                 self.console.print("[yellow]Nothing passed the pre-filter. Exiting.[/yellow]")
@@ -824,7 +834,12 @@ class HorizonOrchestrator:
         """
         self.last_fetch_report = None
         parked: List[SourceFetchOutcome] = []
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        # A blocked or unroutable host must fail fast: a 30s connect timeout
+        # multiplied by retries stalled a whole run when one feed was unreachable.
+        http_timeout = self._http_timeout()
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(http_timeout, connect=min(10.0, http_timeout))
+        ) as client:
             tasks = []
 
             def _skip_if_parked(name: str) -> bool:
@@ -983,6 +998,14 @@ class HorizonOrchestrator:
         items = result.items
         self.console.print(f"   Found {len(items)} items from {name}")
         ok = result.status != "failure"
+        # Tag each item with the task that produced it. The pre-filter runs on the
+        # merged pool, so without this marker a surviving item cannot be credited
+        # back to its source and yield is measured against the wrong row.
+        for item in items:
+            try:
+                item.metadata.setdefault("_source_task", name)
+            except AttributeError:
+                pass
         self._record_source_health(
             name,
             ok=ok,
@@ -1012,6 +1035,67 @@ class HorizonOrchestrator:
             error="; ".join(f"{source}: {error}" for source, error in result.failures.items()) or None,
             failures=result.failures,
         )
+
+    def _http_timeout(self) -> float:
+        """Per-request timeout for source fetching."""
+        collection = getattr(getattr(self, "config", None), "collection", None)
+        raw = getattr(collection, "http_timeout_sec", None)
+        try:
+            value = float(raw) if raw is not None else 30.0
+        except (TypeError, ValueError):
+            value = 30.0
+        return max(5.0, min(value, 120.0))
+
+    @staticmethod
+    def _task_of(item) -> str:
+        """Which fetch task produced this item.
+
+        Yield is recorded per task row (``RSS Feeds``, ``Telegram``), because that
+        is the row the breaker and the cabinet already read.
+        """
+        meta = getattr(item, "metadata", None) or {}
+        task = str(meta.get("_source_task") or "").strip()
+        if task:
+            return task
+        return "unknown"
+
+    def _record_source_yields(self, kept_items, raw_items) -> None:
+        """Attribute survivors back to their sources.
+
+        Called twice in a run: right after fetching (so a run that exits early on
+        "nothing new" still records that every source answered) and again after
+        the pre-filter (which is what actually measures usefulness). Counting only
+        the second call made a healthy radar look like it never measured anything.
+        """
+        state = self.state_store
+        if state is None:
+            return
+        collection = getattr(getattr(self, "config", None), "collection", None)
+        min_yield = getattr(collection, "min_source_yield", None)
+        mute_after = int(getattr(collection, "mute_after_low_yield_runs", 0) or 0)
+
+        fetched_by: dict[str, int] = defaultdict(int)
+        for item in raw_items or []:
+            fetched_by[self._task_of(item)] += 1
+        kept_by: dict[str, int] = defaultdict(int)
+        for item in kept_items or []:
+            kept_by[self._task_of(item)] += 1
+
+        for label, fetched in fetched_by.items():
+            try:
+                state.health_record_yield(
+                    label,
+                    fetched=fetched,
+                    kept=kept_by.get(label, 0),
+                    min_yield=float(min_yield) if min_yield is not None else None,
+                    mute_after=mute_after,
+                )
+            except Exception:
+                # Yield bookkeeping must never break a run.
+                pass
+        # Survivors whose task never reported a fetch are items already in memory
+        # from an earlier run, not a measurement. Writing them would create rows
+        # with kept > 0 and fetched == 0, which is not a ratio at all.
 
     def _record_source_health(
         self,

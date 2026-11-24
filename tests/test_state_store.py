@@ -145,3 +145,86 @@ def test_analysis_cache_respects_ttl(store):
     assert store.cache_get("k1", ttl_hours=72) == {"score": 9}
     assert store.cache_get("k1", ttl_hours=-1) is None
     assert store.cache_prune(ttl_hours=0) == 1
+
+
+def test_source_yield_is_tracked_per_run(store):
+    store.health_record("rss:feed", ok=True, fetched=100)
+    store.health_record_yield("rss:feed", fetched=100, kept=40)
+
+    health = store.health_get("rss:feed")
+    assert health.total_fetched == 100
+    assert health.total_kept == 40
+    assert health.yield_ratio == 0.4
+    assert health.yield_runs == 1
+    assert not health.muted
+
+
+def test_yield_ratio_is_unmeasured_without_a_fetch(store):
+    """A survivor with no fetch behind it is not a ratio and must read as unknown."""
+    store.health_record_yield("rss:mystery", fetched=0, kept=3)
+
+    health = store.health_get("rss:mystery")
+    assert health.yield_ratio is None
+    assert health.total_kept == 3
+    # A source with nothing to fetch must not be muted for it.
+    assert not health.muted
+
+
+def test_low_yield_streak_mutes_after_threshold(store):
+    for _ in range(2):
+        store.health_record_yield("rss:noisy", fetched=200, kept=1, min_yield=0.05, mute_after=3)
+    assert not store.health_get("rss:noisy").muted
+
+    store.health_record_yield("rss:noisy", fetched=200, kept=1, min_yield=0.05, mute_after=3)
+    muted = store.health_get("rss:noisy")
+    assert muted.muted
+    assert muted.low_yield_streak == 3
+    assert muted.muted_reason.startswith("low_yield:")
+
+
+def test_healthy_yield_resets_the_streak(store):
+    store.health_record_yield("rss:mixed", fetched=100, kept=0, min_yield=0.05, mute_after=3)
+    store.health_record_yield("rss:mixed", fetched=100, kept=0, min_yield=0.05, mute_after=3)
+    store.health_record_yield("rss:mixed", fetched=100, kept=50, min_yield=0.05, mute_after=3)
+
+    health = store.health_get("rss:mixed")
+    assert health.low_yield_streak == 0
+    assert not health.muted
+
+
+def test_unmute_clears_the_mark(store):
+    for _ in range(3):
+        store.health_record_yield("rss:dead", fetched=50, kept=0, min_yield=0.05, mute_after=3)
+    assert store.health_get("rss:dead").muted
+
+    store.health_unmute("rss:dead")
+    cleared = store.health_get("rss:dead")
+    assert not cleared.muted
+    assert cleared.muted_reason is None
+    assert cleared.low_yield_streak == 0
+
+
+def test_health_rows_survive_a_pre_existing_database(tmp_path):
+    """An existing state.db predates the yield columns; it must still open."""
+    import sqlite3
+
+    path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        "CREATE TABLE source_health (source_key TEXT PRIMARY KEY,"
+        " consecutive_failures INTEGER NOT NULL DEFAULT 0, cooldown_until REAL,"
+        " last_ok_at REAL, last_error TEXT, total_fetched INTEGER NOT NULL DEFAULT 0,"
+        " avg_latency_ms REAL, updated_at REAL NOT NULL);"
+        "INSERT INTO source_health VALUES ('rss:old', 2, NULL, NULL, 'boom', 42, 10.0, 1.0);"
+    )
+    conn.commit()
+    conn.close()
+
+    with StateStore(path) as legacy:
+        health = legacy.health_get("rss:old")
+        assert health.consecutive_failures == 2
+        assert health.total_fetched == 42
+        # New columns appear with neutral defaults rather than breaking the row.
+        assert health.total_kept == 0
+        assert health.yield_ratio is None
+        assert not health.muted
