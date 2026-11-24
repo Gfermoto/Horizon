@@ -65,6 +65,12 @@ class ContentAnalysis(BaseModel):
     # Short normalized identity of the underlying event (3-6 tokens). The AI
     # emits it in the same analysis pass so cross-day dedup costs no extra call.
     event_key: Optional[str] = None
+    # Optional PR-radar fields (ignored by news profiles).
+    sentiment: Optional[str] = None
+    mention_type: Optional[str] = None
+    risk_summary: Optional[str] = None
+    recommended_action: Optional[str] = None
+    brand_matched: Optional[str] = None
 
 
 class ArtifactSource(BaseModel):

@@ -52,6 +52,17 @@ def item_to_dict(item: Any, *, language: str, index: int) -> Dict[str, Any]:
         artifacts = getattr(processing, "artifacts", None) or {}
         artifact = artifacts.get(language)
     metadata = dict(getattr(item, "metadata", None) or {})
+    if analysis is not None:
+        for key in (
+            "sentiment",
+            "mention_type",
+            "risk_summary",
+            "recommended_action",
+            "brand_matched",
+        ):
+            value = getattr(analysis, key, None)
+            if value:
+                metadata.setdefault(key, value)
 
     blocks: List[Dict[str, Any]] = []
     sources: List[Dict[str, Any]] = []
@@ -100,6 +111,7 @@ def item_to_dict(item: Any, *, language: str, index: int) -> Dict[str, Any]:
         "reason": getattr(analysis, "reason", None) if analysis else None,
         "summary": getattr(analysis, "summary", None) if analysis else None,
         "event_key": getattr(analysis, "event_key", None) if analysis else None,
+        "sentiment": getattr(analysis, "sentiment", None) if analysis else None,
         "tags": list(getattr(analysis, "tags", None) or []) if analysis else [],
         "blocks": blocks,
         "sources": sources,

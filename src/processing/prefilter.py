@@ -102,8 +102,13 @@ def apply_prefilter(
                 continue
 
         if needles:
-            haystack = text.casefold()
-            if not any(needle in haystack for needle in needles):
+            # Entity names are often multi-word ("робот Грин") while headlines
+            # reorder tokens ("Грин — человекоподобный робот"). Substring-only
+            # matching dropped real PR hits; accept a term when all of its
+            # significant tokens appear (same rules as RSS must_match).
+            from ..scrapers.rss import _matches_topic_query
+
+            if not any(_matches_topic_query(text, needle) for needle in needles):
                 result.dropped_must_match += 1
                 continue
 

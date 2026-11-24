@@ -254,20 +254,56 @@ class RSSScraper(BaseScraper):
             str(source.url),
         )
         is_search_feed = _is_search_feed_url(feed_url)
+        response = None
+        last_transport_error: Exception | None = None
         for attempt in range(RATE_LIMIT_RETRIES + 1):
-            response = await self.client.get(
-                feed_url,
-                follow_redirects=True,
-                headers={"User-Agent": RSS_USER_AGENT, "Accept": RSS_ACCEPT},
-            )
-            if response.status_code != 429 or attempt == RATE_LIMIT_RETRIES:
-                break
-            delay = _rate_limit_delay(response, attempt + 1)
-            logger.info(
-                "RSS feed %s rate-limited (429); retrying in %.0fs (%d/%d)",
-                source.name, delay, attempt + 1, RATE_LIMIT_RETRIES,
-            )
-            await asyncio.sleep(delay)
+            try:
+                response = await self.client.get(
+                    feed_url,
+                    follow_redirects=True,
+                    headers={"User-Agent": RSS_USER_AGENT, "Accept": RSS_ACCEPT},
+                )
+                last_transport_error = None
+            except httpx.TransportError as exc:
+                last_transport_error = exc
+                if attempt == RATE_LIMIT_RETRIES:
+                    raise
+                delay = RATE_LIMIT_BACKOFF_SEC * (attempt + 1)
+                logger.info(
+                    "RSS feed %s transport error (%s); retrying in %.0fs (%d/%d)",
+                    source.name,
+                    type(exc).__name__,
+                    delay,
+                    attempt + 1,
+                    RATE_LIMIT_RETRIES,
+                )
+                await asyncio.sleep(delay)
+                continue
+            status_code = response.status_code if isinstance(response.status_code, int) else None
+            if status_code == 429 and attempt < RATE_LIMIT_RETRIES:
+                delay = _rate_limit_delay(response, attempt + 1)
+                logger.info(
+                    "RSS feed %s rate-limited (429); retrying in %.0fs (%d/%d)",
+                    source.name, delay, attempt + 1, RATE_LIMIT_RETRIES,
+                )
+                await asyncio.sleep(delay)
+                continue
+            if (
+                status_code is not None
+                and 500 <= status_code < 600
+                and attempt < RATE_LIMIT_RETRIES
+            ):
+                delay = RATE_LIMIT_BACKOFF_SEC * (attempt + 1)
+                logger.info(
+                    "RSS feed %s server error (%s); retrying in %.0fs (%d/%d)",
+                    source.name, status_code, delay, attempt + 1, RATE_LIMIT_RETRIES,
+                )
+                await asyncio.sleep(delay)
+                continue
+            break
+        if response is None:
+            assert last_transport_error is not None
+            raise last_transport_error
         response.raise_for_status()
         feed = feedparser.parse(response.content, response_headers=dict(response.headers))
         if feed.bozo and not feed.entries and not isinstance(
