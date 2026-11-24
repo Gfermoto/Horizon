@@ -471,12 +471,43 @@ class HorizonOrchestrator:
                     check_event_keys=True,
                 )
                 if event_split.duplicates:
-                    self.console.print(
-                        f"   Skipped {len(event_split.duplicates)} items matching "
-                        "already-published events\n"
-                    )
-                    analyzed_items = event_split.fresh + event_split.updates
-                    self.run_counters["event_skipped"] = len(event_split.duplicates)
+                    mode = getattr(
+                        getattr(self.config, "collection", None),
+                        "event_dedup_mode",
+                        "drop",
+                    ) or "drop"
+                    if mode == "witness":
+                        for item in event_split.duplicates:
+                            metadata = getattr(item, "metadata", None)
+                            if not isinstance(metadata, dict):
+                                try:
+                                    item.metadata = {}
+                                    metadata = item.metadata
+                                except Exception:
+                                    metadata = None
+                            if isinstance(metadata, dict):
+                                metadata["is_witness"] = True
+                        analyzed_items = (
+                            event_split.fresh
+                            + event_split.updates
+                            + event_split.duplicates
+                        )
+                        self.run_counters["event_witnesses"] = len(
+                            event_split.duplicates
+                        )
+                        self.console.print(
+                            f"   Kept {len(event_split.duplicates)} event reprints "
+                            "as witnesses\n"
+                        )
+                    else:
+                        self.console.print(
+                            f"   Skipped {len(event_split.duplicates)} items matching "
+                            "already-published events\n"
+                        )
+                        analyzed_items = event_split.fresh + event_split.updates
+                        self.run_counters["event_skipped"] = len(
+                            event_split.duplicates
+                        )
 
             if not analyzed_items:
                 self.console.print("[yellow]No new content found. Exiting.[/yellow]")

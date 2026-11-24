@@ -93,6 +93,7 @@ def item_to_dict(item: Any, *, language: str, index: int) -> Dict[str, Any]:
         "id": getattr(item, "id", ""),
         "entity_kind": getattr(item, "entity_kind", "article") or "article",
         "is_update": bool(metadata.get("is_update")),
+        "is_witness": bool(metadata.get("is_witness")),
         "canonical_key": getattr(item, "canonical_key", None),
         "title": artifact_title or getattr(item, "title", ""),
         "source_title": getattr(item, "title", ""),

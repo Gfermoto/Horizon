@@ -680,6 +680,9 @@ class CollectionConfig(BaseModel):
     max_items_to_analyze: int = Field(default=0, ge=0)
     # Skip re-analysing identical content seen within this window (0 disables).
     analysis_cache_ttl_hours: float = Field(default=72.0, ge=0)
+    # drop — suppress reprints of already-published event_key (news digests).
+    # witness — keep reprints in the digest as is_witness metadata (PR radar).
+    event_dedup_mode: Literal["drop", "witness"] = "drop"
 
     @field_validator("time_window_hours", mode="before")
     @classmethod
