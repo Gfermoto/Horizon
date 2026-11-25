@@ -273,7 +273,17 @@ class OpenAIClient(AIClient):
         if base_url:
             kwargs["base_url"] = base_url
         if config.provider == AIProvider.GIGACHAT:
-            kwargs["http_client"] = httpx.AsyncClient(verify=False)
+            from .gigachat_auth import GigaChatAuth
+
+            # The saved value is an authorization key, not a bearer token, and the
+            # access token it buys lives 30 minutes while a run lasts hours. The
+            # auth flow renews it in place, so a long run does not die at minute 31
+            # with a 401 that looks like an expired key.
+            kwargs["http_client"] = httpx.AsyncClient(
+                verify=False, auth=GigaChatAuth(api_key)
+            )
+            # A placeholder the SDK will overwrite on every request via auth_flow.
+            kwargs["api_key"] = "gigachat-oauth"
 
         self.client = AsyncOpenAI(**kwargs)
         self.model = config.model

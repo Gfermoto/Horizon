@@ -414,9 +414,13 @@ class HorizonOrchestrator:
 
             if not all_items:
                 # Nothing new, but the sources did answer: record that so a healthy
-                # radar never looks like one that was never measured.
+                # radar never looks like one that was never measured. This must not
+                # count as a yield sample: every item here was already seen, so the
+                # ratio would be 0% and three quiet days would mute a healthy feed.
                 self._record_source_yields(
-                    [], self.last_fetch_report.all_items() if self.last_fetch_report else []
+                    [],
+                    self.last_fetch_report.all_items() if self.last_fetch_report else [],
+                    count_yield=False,
                 )
                 self.console.print("[yellow]No new content found. Exiting.[/yellow]")
                 return
@@ -1059,13 +1063,17 @@ class HorizonOrchestrator:
             return task
         return "unknown"
 
-    def _record_source_yields(self, kept_items, raw_items) -> None:
+    def _record_source_yields(self, kept_items, raw_items, *, count_yield: bool = True) -> None:
         """Attribute survivors back to their sources.
 
         Called twice in a run: right after fetching (so a run that exits early on
         "nothing new" still records that every source answered) and again after
         the pre-filter (which is what actually measures usefulness). Counting only
         the second call made a healthy radar look like it never measured anything.
+
+        ``count_yield=False`` records only liveness. The first call must not count
+        a sample: on the "nothing new" path every item was already seen, so the
+        ratio is 0% by construction and three quiet runs would mute a good feed.
         """
         state = self.state_store
         if state is None:
@@ -1073,6 +1081,7 @@ class HorizonOrchestrator:
         collection = getattr(getattr(self, "config", None), "collection", None)
         min_yield = getattr(collection, "min_source_yield", None)
         mute_after = int(getattr(collection, "mute_after_low_yield_runs", 0) or 0)
+        effective_min = float(min_yield) if (min_yield is not None and count_yield) else None
 
         fetched_by: dict[str, int] = defaultdict(int)
         for item in raw_items or []:
@@ -1087,8 +1096,9 @@ class HorizonOrchestrator:
                     label,
                     fetched=fetched,
                     kept=kept_by.get(label, 0),
-                    min_yield=float(min_yield) if min_yield is not None else None,
+                    min_yield=effective_min,
                     mute_after=mute_after,
+                    record_sample=count_yield,
                 )
             except Exception:
                 # Yield bookkeeping must never break a run.

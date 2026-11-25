@@ -608,20 +608,27 @@ class StateStore:
         kept: int,
         min_yield: float | None = None,
         mute_after: int = 3,
+        record_sample: bool = True,
     ) -> SourceHealth:
         """Account how many fetched items survived the pre-filter.
 
         A source that answers but never contributes is as useless as a dead one.
         A streak of runs below ``min_yield`` marks it muted; the mark is advisory,
         and the cabinet decides whether to disable the source.
+
+        ``record_sample=False`` only refreshes liveness: the "nothing new" path
+        has every item already seen, so counting it as a 0% sample muted healthy
+        feeds after three quiet days.
         """
         current = self.health_get(source_key)
-        total_kept = current.total_kept + max(0, int(kept))
-        yield_runs = current.yield_runs + 1
+        # Both counters describe the same sample, so a liveness-only call must not
+        # inflate them: the pre-filter pass already credits the survivors.
+        total_kept = current.total_kept + (max(0, int(kept)) if record_sample else 0)
+        yield_runs = current.yield_runs + (1 if record_sample else 0)
         streak = current.low_yield_streak
         muted_reason = current.muted_reason
 
-        if min_yield is not None and fetched > 0:
+        if record_sample and min_yield is not None and fetched > 0:
             ratio = max(0, int(kept)) / max(1, int(fetched))
             streak = streak + 1 if ratio < float(min_yield) else 0
             if mute_after > 0 and streak >= mute_after and not muted_reason:
