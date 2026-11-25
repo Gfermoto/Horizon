@@ -779,16 +779,45 @@ class HorizonOrchestrator:
         }
 
     def _sources_health_rows(self) -> List[Dict[str, object]]:
+        """Health rows for the sources this run actually touched.
+
+        ``health_all()`` returns every source ever recorded, including ones the
+        tenant has since switched off. A disabled connector then keeps its last
+        error alive forever: VK stayed in the report as "no token" long after the
+        addon was turned off, which held the snapshot at ``partial_failure`` and
+        made the cabinet look broken for a source nobody was collecting.
+
+        Records that still matter are kept: a source muted for low yield, or one
+        inside its cooldown window, is exactly what the operator needs to see.
+        """
         state = self.state_store
         if state is None:
             return [
                 outcome.to_dict()
                 for outcome in (self.last_fetch_report.outcomes if self.last_fetch_report else [])
             ]
+
+        attempted = set()
+        if self.last_fetch_report is not None:
+            for outcome in self.last_fetch_report.outcomes:
+                name = getattr(outcome, "source_name", None)
+                if name:
+                    attempted.add(str(name))
+
+        now = time.time()
+        rows: List[Dict[str, object]] = []
         try:
-            return [health.to_dict() for health in state.health_all()]
+            for health in state.health_all():
+                relevant = (
+                    health.source_key in attempted
+                    or bool(getattr(health, "muted_reason", ""))
+                    or (health.cooldown_until is not None and health.cooldown_until > now)
+                )
+                if relevant:
+                    rows.append(health.to_dict())
         except Exception:
             return []
+        return rows
 
     def _write_run_report(self, *, date: str, status: str, error: str | None = None) -> None:
         """Persist per-run diagnostics for operators and downstream schedulers."""

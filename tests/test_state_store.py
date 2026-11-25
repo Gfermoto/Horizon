@@ -228,3 +228,36 @@ def test_health_rows_survive_a_pre_existing_database(tmp_path):
         assert health.total_kept == 0
         assert health.yield_ratio is None
         assert not health.muted
+
+
+def test_run_report_keeps_only_sources_this_run_touched(store):
+    """A switched-off connector must stop reporting its old error.
+
+    ``health_all()`` returns every source ever recorded. VK kept "no token" in
+    the report long after the addon was turned off, which held the snapshot at
+    ``partial_failure`` and made the cabinet look broken for a source nobody was
+    collecting. Sources still relevant - muted for low yield, or inside a cooldown
+    - stay, because the operator needs to see those.
+    """
+    import time
+
+    from src.orchestrator import FetchReport, HorizonOrchestrator, SourceFetchOutcome
+
+    store.health_record("Сообщества VK", ok=False, error="нет токена")
+    store.health_record("Посты vc.ru", ok=True, fetched=10)
+    store.health_record("Старый фид", ok=False, error="timeout", cooldown_seconds=3600)
+
+    orchestrator = object.__new__(HorizonOrchestrator)
+    orchestrator._state_store = store
+    orchestrator.last_fetch_report = FetchReport(
+        outcomes=[
+            SourceFetchOutcome(source_name="Посты vc.ru", status="success"),
+        ]
+    )
+
+    keys = {row["source_key"] for row in orchestrator._sources_health_rows()}
+
+    assert "Сообщества VK" not in keys
+    assert "Посты vc.ru" in keys
+    # Still inside its cooldown, so it is news the operator can act on.
+    assert "Старый фид" in keys
