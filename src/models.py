@@ -181,7 +181,7 @@ AI_PROVIDER_DEFAULTS = {
         "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
     },
     AIProvider.GEMINI: {
-        "model": "gemini-1.5-flash",
+        "model": "gemini-3.1-flash-lite",
         "api_key_env": "GOOGLE_API_KEY",
         "base_url": None,
     },
