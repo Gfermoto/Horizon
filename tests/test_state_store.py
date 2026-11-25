@@ -247,11 +247,32 @@ def test_run_report_keeps_only_sources_this_run_touched(store):
     store.health_record("Посты vc.ru", ok=True, fetched=10)
     store.health_record("Старый фид", ok=False, error="timeout", cooldown_seconds=3600)
 
+    class _Custom:
+        def __init__(self, name: str, enabled: bool = True):
+            self.name = name
+            self.type = name
+            self.enabled = enabled
+
+    class _Sources:
+        custom = [
+            _Custom("Посты vc.ru"),
+            _Custom("Сообщества VK", enabled=False),
+            # Configured but currently parked: its row is actionable news.
+            _Custom("Старый фид"),
+        ]
+
+    class _Config:
+        sources = _Sources()
+
     orchestrator = object.__new__(HorizonOrchestrator)
+    orchestrator.config = _Config()
     orchestrator._state_store = store
     orchestrator.last_fetch_report = FetchReport(
         outcomes=[
             SourceFetchOutcome(source_name="Посты vc.ru", status="success"),
+            # Parked by the circuit breaker: no fetch happened, so this must not
+            # count as participation.
+            SourceFetchOutcome(source_name="Сообщества VK", status="skipped_cooldown"),
         ]
     )
 

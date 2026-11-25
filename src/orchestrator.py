@@ -800,14 +800,32 @@ class HorizonOrchestrator:
         attempted = set()
         if self.last_fetch_report is not None:
             for outcome in self.last_fetch_report.outcomes:
+                # A source parked by the circuit breaker produced no fetch at all,
+                # so its row is history, not news. This is how VK survived after
+                # its addon was switched off: the old error kept its cooldown, the
+                # cooldown produced a `skipped_cooldown` outcome, and that outcome
+                # put the row back into every later report.
+                if getattr(outcome, "status", "") == "skipped_cooldown":
+                    continue
                 name = getattr(outcome, "source_name", None)
                 if name:
                     attempted.add(str(name))
 
         now = time.time()
+        # A connector that is switched off cannot produce health news, whatever
+        # its last recorded state says. Without this the row survived on two
+        # paths at once: a `skipped_cooldown` outcome counted as participation,
+        # and its unexpired cooldown counted as relevance.
+        configured = {
+            str(custom.name or custom.type)
+            for custom in (getattr(self.config.sources, "custom", None) or [])
+            if getattr(custom, "enabled", True)
+        }
         rows: List[Dict[str, object]] = []
         try:
             for health in state.health_all():
+                if health.source_key not in configured:
+                    continue
                 relevant = (
                     health.source_key in attempted
                     or bool(getattr(health, "muted_reason", ""))
